@@ -51,7 +51,7 @@ paru -S omastart
 ### Option 2: Quick Install (Git)
 
 ```bash
-git clone https://github.com/loathe/omastart.git
+git clone https://github.com/vw5tywrl/omastart.git
 cd omastart
 ./install.sh
 ```

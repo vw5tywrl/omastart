@@ -12,7 +12,7 @@ optdepends=(
     'hyprland: autostart.conf management'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('9fe0e58b91d1c6c1f9ce6c8731cfde0531de275b15a617dee9043fc1de40ec80')
 
 package() {
     cd "$srcdir/$pkgname-$pkgver"

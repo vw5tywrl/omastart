@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Omastart
+GenericName=Startup Manager
+Comment=Dead-simple startup package and service manager
+Exec=omastart
+Icon=omarchy-startup
+Terminal=false
+Categories=System;Utility;
+Keywords=omastart;omarchy-startup;startup;autostart;boot;systemd;packages;omarchy;hyprland;
+StartupWMClass=org.quickshell

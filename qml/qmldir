@@ -1,0 +1,3 @@
+singleton OmaTheme 1.0 OmaTheme.qml
+OmaButton 1.0 OmaButton.qml
+OmaSwitch 1.0 OmaSwitch.qml

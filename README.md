@@ -38,14 +38,15 @@ Run `omastart` from terminal or your application launcher.
 
 - `j` / `k` or `Up` / `Down`: navigate
 - `Space`: toggle service
+- `m`: toggle between Applications and System & Services views
 - `u`: undo last toggle
 - `Enter`: inspect service details and logs
 - `e`: open config file in `$EDITOR` at exact line
 - `r`: restart / rerun service
-- `b`: view boot performance breakdown
+- `b`: view boot performance breakdown (critical path & slowest units)
 - `!`: filter failed units
 - `a`: add startup entry
-- `Tab`: switch between Packages and Layers view
+- `Tab`: switch between Packages and Layers view (in System mode)
 - `d`: show / hide disabled entries
 - `s`: cycle sort (default, boot time, name)
 - `/`: search filter
@@ -62,6 +63,14 @@ omastart --list --all
 
 # Output as JSON
 omastart --json
+
+# View systemd critical-chain dependency tree
+omastart critical-chain
+
+# Save or restore startup state snapshots
+omastart snapshot save "my_preset"
+omastart snapshot list
+omastart snapshot restore "my_preset"
 ```
 
 ## License

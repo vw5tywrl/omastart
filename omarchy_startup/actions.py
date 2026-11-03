@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import configparser
+from datetime import datetime
+import json
 import os
 from pathlib import Path
 import re
@@ -538,3 +540,135 @@ def fetch_unit_logs_raw(payload: dict, lines: int = 60) -> str:
         )
         return out.strip() or "No systemd journal entries for this XDG entry."
     return ""
+
+
+def mask_item_raw(payload: dict) -> tuple[bool, str]:
+    source = SourceKind(payload["source"])
+    unit_name = payload.get("unitName", "")
+    if not unit_name:
+        return False, "Not a systemd unit."
+    if source == SourceKind.SYSTEMD_USER:
+        rc, _, err = _run_cmd(["systemctl", "--user", "mask", unit_name], timeout=8.0)
+        if rc != 0:
+            return False, err.strip() or "systemctl --user mask failed"
+        return True, f"{unit_name}: masked"
+    elif source == SourceKind.SYSTEMD_SYSTEM:
+        rc, _, err = _run_cmd(["pkexec", "systemctl", "mask", unit_name], timeout=45.0)
+        if rc != 0:
+            return False, err.strip() or "Authorization canceled"
+        return True, f"{unit_name}: masked"
+    return False, "Only systemd units can be masked."
+
+
+SETTINGS_FILE = HOME / ".config" / "omastart" / "settings.json"
+
+
+def get_settings_raw() -> dict:
+    if SETTINGS_FILE.is_file():
+        try:
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"rememberMode": False, "mode": "apps"}
+
+
+def save_settings_raw(settings: dict) -> tuple[bool, str]:
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        curr = get_settings_raw()
+        curr.update(settings)
+        SETTINGS_FILE.write_text(json.dumps(curr, indent=2), encoding="utf-8")
+        return True, "Settings saved"
+    except Exception as e:
+        return False, str(e)
+
+
+SNAPSHOT_DIR = HOME / ".config" / "omastart" / "snapshots"
+
+
+def save_snapshot_raw(name: str = "") -> tuple[bool, str]:
+    from .collector import collect_all_startup_data
+
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    snap_id = f"snap_{now_str}"
+    label = name.strip() or now_str
+    summary = collect_all_startup_data()
+    data = {
+        "id": snap_id,
+        "label": label,
+        "timestamp": now_str,
+        "items": [
+            {
+                "id": it.id,
+                "name": it.name,
+                "source": it.source.value,
+                "enabled": it.enabled,
+                "unitName": it.unit_name,
+                "configPath": it.config_path,
+                "command": it.command,
+                "lineNumber": it.line_number or 0,
+            }
+            for it in summary.items
+        ],
+    }
+    file_path = SNAPSHOT_DIR / f"{snap_id}.json"
+    try:
+        file_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return True, f"Saved snapshot '{label}' ({len(data['items'])} items)"
+    except Exception as e:
+        return False, str(e)
+
+
+def list_snapshots_raw() -> list[dict]:
+    if not SNAPSHOT_DIR.is_dir():
+        return []
+    out = []
+    for p in sorted(SNAPSHOT_DIR.glob("snap_*.json"), reverse=True):
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            out.append(
+                {
+                    "id": d.get("id", p.stem),
+                    "label": d.get("label", p.stem),
+                    "timestamp": d.get("timestamp", ""),
+                    "itemCount": len(d.get("items", [])),
+                    "file": str(p),
+                }
+            )
+        except Exception:
+            pass
+    return out
+
+
+def restore_snapshot_raw(snap_id: str) -> tuple[bool, str]:
+    file_path = SNAPSHOT_DIR / f"{snap_id}.json"
+    if not file_path.is_file():
+        matches = list(SNAPSHOT_DIR.glob(f"*{snap_id}*.json"))
+        if matches:
+            file_path = matches[0]
+        else:
+            return False, f"Snapshot not found: {snap_id}"
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"Failed to read snapshot: {e}"
+
+    from .collector import collect_all_startup_data
+
+    summary = collect_all_startup_data()
+    curr_map = {it.id: it for it in summary.items}
+    restored_cnt = 0
+
+    for rec in data.get("items", []):
+        rec_id = rec.get("id")
+        rec_enabled = rec.get("enabled", True)
+        if rec_id in curr_map:
+            curr_item = curr_map[rec_id]
+            if curr_item.enabled != rec_enabled and not curr_item.read_only:
+                ok, _ = set_item_enabled_raw(curr_item.to_ui_dict(), rec_enabled)
+                if ok:
+                    restored_cnt += 1
+
+    return True, f"Restored snapshot '{data.get('label', snap_id)}' ({restored_cnt} changes applied)"
+

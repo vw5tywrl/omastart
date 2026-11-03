@@ -9,6 +9,12 @@ ShellRoot {
 
   readonly property string backendBin: Quickshell.env("OMARCHY_STARTUP_BIN") || (Quickshell.env("HOME") + "/.local/bin/omarchy-startup")
 
+  // Mode state: "apps" (simple desktop apps) | "system" (advanced system services & daemons)
+  property string currentMode: "apps"
+  property string selectedLaunchMode: "apps"
+  property bool modePromptOpen: false
+  property bool rememberModeChoice: false
+
   // Data state
   property var allItems: []
   property var visibleRows: []      // [{ kind: "header", title, rightMeta }, { kind: "item", item }]
@@ -20,6 +26,7 @@ ShellRoot {
   property string bootRaw: ""
   property var bootStages: []
   property var slowestUnits: []
+  property var criticalChain: []
   property bool loading: true
   property bool busyAction: false
   property string statusMessage: ""
@@ -54,6 +61,7 @@ ShellRoot {
   property var confirmDisableItem: null
   property bool addModalOpen: false
   property bool bootModalOpen: false
+  property string bootTab: "chain"       // "chain" | "slowest"
   property string addTab: "app"          // "app" | "hypr" | "hook"
   property int appCursorIndex: 0
 
@@ -109,12 +117,38 @@ ShellRoot {
           app.bootRaw = payload.rawBreakdown || ""
           app.bootStages = payload.stages || []
           app.slowestUnits = payload.slowestUnits || []
+          app.criticalChain = payload.criticalChain || []
           app.allItems = payload.items || []
           app.recomputeMetrics()
           app.rebuildRows()
         } catch (e) {
           app.toast("Failed to parse startup state")
         }
+      }
+    }
+  }
+
+  Process {
+    id: settingsProc
+    command: [app.backendBin, "--backend", "settings-get"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var s = JSON.parse(String(text || "{}"))
+          if (s.rememberMode && s.mode) {
+            app.currentMode = s.mode
+            app.modePromptOpen = false
+          } else {
+            app.currentMode = s.mode || "apps"
+            app.selectedLaunchMode = app.currentMode
+            app.modePromptOpen = true
+          }
+        } catch (e) {
+          app.modePromptOpen = true
+        }
+        app.recomputeMetrics()
+        app.rebuildRows()
       }
     }
   }
@@ -186,6 +220,16 @@ ShellRoot {
     busyAction = true
     actionProc.argsList = [app.backendBin, "--backend", subcmd, JSON.stringify(objPayload)]
     actionProc.running = true
+  }
+
+  function confirmLaunchMode() {
+    app.currentMode = app.selectedLaunchMode
+    app.modePromptOpen = false
+    if (app.rememberModeChoice) {
+      runBackendAction("settings-set", { rememberMode: true, mode: app.currentMode })
+    }
+    app.recomputeMetrics()
+    app.rebuildRows()
   }
 
   function requestToggle(item) {
@@ -278,6 +322,18 @@ ShellRoot {
     appCursorIndex = out.length > 0 ? 0 : -1
   }
 
+  function isItemInActiveMode(it) {
+    if (currentMode === "apps") {
+      return (
+        it.source === "hyprland-user" ||
+        it.source === "hyprland-default" ||
+        it.source === "xdg-autostart" ||
+        it.source === "hook-post-boot"
+      )
+    }
+    return true
+  }
+
   function recomputeMetrics() {
     var enabledCnt = 0
     var runningCnt = 0
@@ -287,6 +343,8 @@ ShellRoot {
 
     for (var i = 0; i < allItems.length; i++) {
       var it = allItems[i]
+      if (!isItemInActiveMode(it)) continue
+
       if (it.enabled) {
         enabledCnt++
         if (it.pkgName) pkgSet[it.pkgName] = true
@@ -313,6 +371,7 @@ ShellRoot {
 
     for (var i = 0; i < allItems.length; i++) {
       var it = allItems[i]
+      if (!isItemInActiveMode(it)) continue
       if (filterFailedOnly && it.runningState !== "failed") continue
       if (!showDisabled && !it.enabled && !keepVisibleIds[it.id]) continue
       if (scopeFilter !== "all" && it.category !== scopeFilter) continue
@@ -354,7 +413,7 @@ ShellRoot {
       for (var f = 0; f < filtered.length; f++) {
         rows.push({ kind: "item", item: filtered[f] })
       }
-    } else if (viewMode === "packages") {
+    } else if (viewMode === "packages" || currentMode === "apps") {
       var groups = ({})
       for (var p = 0; p < filtered.length; p++) {
         var item = filtered[p]
@@ -406,7 +465,7 @@ ShellRoot {
         }
       }
     } else {
-      // Layers view
+      // Layers view (Advanced Mode)
       var bySrc = ({})
       var srcOrder = []
       filtered.sort(function(a, b) {
@@ -525,6 +584,7 @@ ShellRoot {
 
   Component.onCompleted: {
     reloadScan()
+    settingsProc.running = true
   }
 
   // ---- Main Window ----------------------------------------------------------
@@ -546,9 +606,36 @@ ShellRoot {
       anchors.fill: parent
       focus: true
 
-      readonly property bool modalOpen: app.inspectedItem !== null || app.confirmDisableItem !== null || app.addModalOpen || app.bootModalOpen
+      readonly property bool modalOpen: app.inspectedItem !== null || app.confirmDisableItem !== null || app.addModalOpen || app.bootModalOpen || app.modePromptOpen
 
       Keys.onPressed: function(event) {
+        // 0. Mode prompt dialog keys
+        if (app.modePromptOpen) {
+          if (event.key === Qt.Key_1) {
+            app.selectedLaunchMode = "apps"
+            event.accepted = true
+          } else if (event.key === Qt.Key_2) {
+            app.selectedLaunchMode = "system"
+            event.accepted = true
+          } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
+            app.selectedLaunchMode = "apps"
+            event.accepted = true
+          } else if (event.key === Qt.Key_Right || event.key === Qt.Key_L) {
+            app.selectedLaunchMode = "system"
+            event.accepted = true
+          } else if (event.key === Qt.Key_Space) {
+            app.rememberModeChoice = !app.rememberModeChoice
+            event.accepted = true
+          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            app.confirmLaunchMode()
+            event.accepted = true
+          } else if (event.key === Qt.Key_Escape) {
+            app.confirmLaunchMode()
+            event.accepted = true
+          }
+          return
+        }
+
         // 1. Confirm modal keys
         if (app.confirmDisableItem !== null) {
           if (event.key === Qt.Key_Escape || event.key === Qt.Key_N) {
@@ -587,7 +674,7 @@ ShellRoot {
             }
             event.accepted = true
           } else if (event.key === Qt.Key_X) {
-            if (app.inspectedItem && app.inspectedItem.canDelete && !app.inspectedItem.readOnly) {
+            if (app.inspectedItem && (app.inspectedItem.canDelete || app.inspectedItem.isUninstalled) && !app.inspectedItem.readOnly) {
               app.runBackendAction("delete", { item: app.inspectedItem })
             }
             event.accepted = true
@@ -612,6 +699,9 @@ ShellRoot {
         if (app.bootModalOpen) {
           if (event.key === Qt.Key_Escape || event.key === Qt.Key_B || event.key === Qt.Key_Q) {
             app.bootModalOpen = false
+            event.accepted = true
+          } else if (event.key === Qt.Key_Tab) {
+            app.bootTab = (app.bootTab === "chain") ? "slowest" : "chain"
             event.accepted = true
           }
           return
@@ -722,6 +812,12 @@ ShellRoot {
         } else if (event.key === Qt.Key_U) {
           app.undoLastToggle()
           event.accepted = true
+        } else if (event.key === Qt.Key_M) {
+          app.currentMode = (app.currentMode === "apps") ? "system" : "apps"
+          app.recomputeMetrics()
+          app.rebuildRows()
+          app.toast("Switched to " + (app.currentMode === "apps" ? "Applications" : "System & Services") + " view")
+          event.accepted = true
         } else if (event.key === Qt.Key_B) {
           app.bootModalOpen = !app.bootModalOpen
           event.accepted = true
@@ -735,10 +831,12 @@ ShellRoot {
           if (sel) app.openInspector(sel)
           event.accepted = true
         } else if (event.key === Qt.Key_Tab) {
-          app.filterFailedOnly = false
-          app.viewMode = (app.viewMode === "packages") ? "layers" : "packages"
-          app.rebuildRows()
-          event.accepted = true
+          if (app.currentMode === "system") {
+            app.filterFailedOnly = false
+            app.viewMode = (app.viewMode === "packages") ? "layers" : "packages"
+            app.rebuildRows()
+            event.accepted = true
+          }
         } else if (event.key === Qt.Key_D) {
           app.showDisabled = !app.showDisabled
           app.recomputeMetrics()
@@ -760,9 +858,9 @@ ShellRoot {
           app.scopeFilter = "hyprland"; app.rebuildRows(); event.accepted = true
         } else if (event.key === Qt.Key_3) {
           app.scopeFilter = "xdg"; app.rebuildRows(); event.accepted = true
-        } else if (event.key === Qt.Key_4) {
+        } else if (event.key === Qt.Key_4 && app.currentMode === "system") {
           app.scopeFilter = "systemd-user"; app.rebuildRows(); event.accepted = true
-        } else if (event.key === Qt.Key_5) {
+        } else if (event.key === Qt.Key_5 && app.currentMode === "system") {
           app.scopeFilter = "systemd-system"; app.rebuildRows(); event.accepted = true
         }
       }
@@ -820,8 +918,33 @@ ShellRoot {
               }
             }
 
+            // Mode switcher: APPS vs SYSTEM
             Row {
               spacing: 0
+              OmaButton {
+                text: "APPS"
+                active: app.currentMode === "apps"
+                onClicked: {
+                  app.currentMode = "apps"
+                  app.recomputeMetrics()
+                  app.rebuildRows()
+                }
+              }
+              OmaButton {
+                text: "SYSTEM"
+                active: app.currentMode === "system"
+                onClicked: {
+                  app.currentMode = "system"
+                  app.recomputeMetrics()
+                  app.rebuildRows()
+                }
+              }
+            }
+
+            // View modes in System mode
+            Row {
+              spacing: 0
+              visible: app.currentMode === "system"
               OmaButton {
                 text: "PACKAGES"
                 active: app.viewMode === "packages" && !app.filterFailedOnly
@@ -863,6 +986,9 @@ ShellRoot {
             textFormat: Text.PlainText
             text: {
               if (app.loading) return "scanning..."
+              if (app.currentMode === "apps") {
+                return app.countEnabled + " apps launch at login  ·  " + app.countPackages + " pkgs"
+              }
               if (width >= 320) {
                 return app.countEnabled + " enabled  ·  " + app.countPackages + " pkgs  ·  " +
                        app.countRunning + " active  ·  boot " + app.bootUserspace
@@ -961,7 +1087,7 @@ ShellRoot {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
                     visible: filterInput.text.length === 0 && !filterInput.activeFocus
-                    text: "Filter packages, units, binaries..."
+                    text: app.currentMode === "apps" ? "Filter startup applications..." : "Filter packages, units, binaries..."
                     font.family: OmaTheme.fontFamily
                     font.pixelSize: OmaTheme.fontSmall
                     color: OmaTheme.faint
@@ -1015,13 +1141,19 @@ ShellRoot {
                 height: 20
 
                 Repeater {
-                  model: [
-                    { id: "all", label: "ALL" },
-                    { id: "hyprland", label: "HYPRLAND" },
-                    { id: "xdg", label: "XDG" },
-                    { id: "systemd-user", label: "USER" },
-                    { id: "systemd-system", label: "SYSTEM" }
-                  ]
+                  model: app.currentMode === "apps"
+                    ? [
+                        { id: "all", label: "ALL APPS" },
+                        { id: "hyprland", label: "HYPRLAND" },
+                        { id: "xdg", label: "XDG" }
+                      ]
+                    : [
+                        { id: "all", label: "ALL" },
+                        { id: "hyprland", label: "HYPRLAND" },
+                        { id: "xdg", label: "XDG" },
+                        { id: "systemd-user", label: "USER" },
+                        { id: "systemd-system", label: "SYSTEM" }
+                      ]
 
                   delegate: Item {
                     readonly property bool isSelected: app.scopeFilter === modelData.id
@@ -1221,8 +1353,8 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             visible: parent.width >= 520
             text: parent.width >= 760
-              ? "j/k move  ·  Space toggle  ·  u undo  ·  Enter inspect  ·  b boot  ·  / search  ·  Tab view  ·  d disabled  ·  a add  ·  q quit"
-              : "j/k  ·  Space  ·  u  ·  Enter  ·  b  ·  /  ·  Tab  ·  d  ·  a  ·  q"
+              ? "j/k move  ·  Space toggle  ·  m mode  ·  u undo  ·  Enter inspect  ·  b boot  ·  / search  ·  a add  ·  q quit"
+              : "j/k  ·  Space  ·  m  ·  u  ·  Enter  ·  b  ·  /  ·  a  ·  q"
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontCaption
             color: OmaTheme.dim
@@ -1374,9 +1506,49 @@ ShellRoot {
             color: OmaTheme.red
           }
 
+          // Uninstalled tag (when binary was deleted/uninstalled but config entry remains)
+          Item {
+            id: uninstalledSlot
+            visible: itemRect.it.isUninstalled
+            anchors.left: itemRect.it.isCritical ? critTag.right : nameText.right
+            anchors.leftMargin: 8
+            anchors.verticalCenter: parent.verticalCenter
+            width: uninstalledTxt.implicitWidth + 8
+            height: 16
+
+            Rectangle {
+              anchors.fill: parent
+              radius: OmaTheme.cornerRadius
+              color: OmaTheme.rgba(OmaTheme.yellow, 0.15)
+              border.width: 1
+              border.color: OmaTheme.rgba(OmaTheme.yellow, 0.40)
+            }
+
+            Text {
+              id: uninstalledTxt
+              anchors.centerIn: parent
+              text: "uninstalled"
+              font.family: OmaTheme.fontFamily
+              font.pixelSize: OmaTheme.fontCaption
+              color: OmaTheme.yellow
+            }
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onEntered: app.statusMessage = "This package was uninstalled, but remains in your startup configuration."
+              onExited: app.statusMessage = ""
+              onClicked: {
+                app.cursorItemId = itemRect.it.id
+                app.openInspector(itemRect.it)
+              }
+            }
+          }
+
           // Middle subtle description / command
           Text {
-            anchors.left: itemRect.it.isCritical ? critTag.right : nameText.right
+            anchors.left: itemRect.it.isUninstalled ? uninstalledSlot.right : (itemRect.it.isCritical ? critTag.right : nameText.right)
             anchors.leftMargin: 12
             anchors.right: bootCol.left
             anchors.rightMargin: 12
@@ -1396,7 +1568,7 @@ ShellRoot {
             anchors.right: tagCol.left
             anchors.rightMargin: 12
             anchors.verticalCenter: parent.verticalCenter
-            width: itemRect.width >= 620 ? 58 : 0
+            width: (app.currentMode === "system" && itemRect.width >= 620) ? 58 : 0
             visible: width > 0
             horizontalAlignment: Text.AlignRight
             text: itemRect.it.bootTimeText
@@ -1410,7 +1582,8 @@ ShellRoot {
             anchors.right: stateCol.left
             anchors.rightMargin: 12
             anchors.verticalCenter: parent.verticalCenter
-            width: app.viewMode === "layers" ? 110 : 42
+            width: app.viewMode === "layers" ? 110 : (app.currentMode === "apps" ? 0 : 42)
+            visible: width > 0
             horizontalAlignment: Text.AlignRight
             elide: Text.ElideRight
             textFormat: Text.PlainText
@@ -1533,11 +1706,44 @@ ShellRoot {
 
             Rectangle { width: parent.width; height: 1; color: OmaTheme.hairline }
 
+            // Uninstalled Warning Alert
+            Rectangle {
+              visible: app.inspectedItem !== null && app.inspectedItem.isUninstalled
+              width: parent.width
+              height: 32
+              radius: OmaTheme.cornerRadius
+              color: OmaTheme.rgba(OmaTheme.yellow, 0.12)
+              border.width: 1
+              border.color: OmaTheme.rgba(OmaTheme.yellow, 0.40)
+
+              Row {
+                anchors.fill: parent
+                anchors.margins: 6
+                spacing: 8
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "⚠"
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontBody
+                  color: OmaTheme.yellow
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "This application was uninstalled, but remains in your startup configuration."
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSmall
+                  color: OmaTheme.yellow
+                }
+              }
+            }
+
             // Scrollable metadata + journal
             ScrollView {
               id: inspScroll
               width: parent.width
-              height: parent.height - 24 - 30 - 22
+              height: parent.height - 24 - 30 - (app.inspectedItem && app.inspectedItem.isUninstalled ? 54 : 22)
               clip: true
               ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
@@ -1549,10 +1755,18 @@ ShellRoot {
                   model: {
                     var it = app.inspectedItem
                     if (!it) return []
+                    var triggerLabels = {
+                      "login": "At login (desktop session autostart)",
+                      "boot": "At boot (system startup target)",
+                      "on-demand": "On-demand (socket / bus activation)",
+                      "scheduled": "Scheduled (systemd timer)",
+                      "hook": "Post-boot hook script"
+                    }
                     var rows = [
                       { k: "PACKAGE", v: it.pkgName ? (it.pkgName + (it.pkgVersion ? " " + it.pkgVersion : "") + (it.pkgSize ? "  (" + it.pkgSize + ")" : "")) : "user / local" },
                       { k: "SUMMARY", v: it.pkgDesc || it.description || "—" },
                       { k: "LAYER",   v: it.sourceLabel },
+                      { k: "TRIGGER", v: triggerLabels[it.triggerType] || it.triggerType || "login" },
                       { k: "STATUS",  v: it.runningLabel + (it.bootTimeText ? "  ·  boot " + it.bootTimeText : "") }
                     ]
                     if (it.pid && it.pid > 0) rows.push({ k: "PID", v: String(it.pid) })
@@ -1668,6 +1882,18 @@ ShellRoot {
               }
 
               OmaButton {
+                visible: app.inspectedItem !== null && !app.inspectedItem.isMasked && (app.inspectedItem.source === "systemd-user" || app.inspectedItem.source === "systemd-system")
+                text: "MASK"
+                onClicked: {
+                  if (app.inspectedItem) {
+                    var mit = app.inspectedItem
+                    app.inspectedItem = null
+                    app.runBackendAction("mask", { item: mit })
+                  }
+                }
+              }
+
+              OmaButton {
                 text: "COPY CMD"
                 onClicked: {
                   if (app.inspectedItem) {
@@ -1693,8 +1919,8 @@ ShellRoot {
               }
 
               OmaButton {
-                visible: app.inspectedItem !== null && app.inspectedItem.canDelete && !app.inspectedItem.readOnly
-                text: "REMOVE · X"
+                visible: app.inspectedItem !== null && (app.inspectedItem.canDelete || app.inspectedItem.isUninstalled) && !app.inspectedItem.readOnly
+                text: app.inspectedItem && app.inspectedItem.isUninstalled ? "REMOVE FROM STARTUP" : "REMOVE · X"
                 dangerStyle: true
                 onClicked: if (app.inspectedItem) app.runBackendAction("delete", { item: app.inspectedItem })
               }
@@ -1704,7 +1930,7 @@ ShellRoot {
       }
 
       // ======================================================================
-      // MODAL 2: Boot Breakdown
+      // MODAL 2: Boot Breakdown (Critical Path & Slowest Units)
       // ======================================================================
       Rectangle {
         anchors.fill: parent
@@ -1720,8 +1946,8 @@ ShellRoot {
         Rectangle {
           id: bootBreakdownCard
           anchors.centerIn: parent
-          width: Math.min(parent.width - 36, 680)
-          height: Math.min(parent.height - 36, 480)
+          width: Math.min(parent.width - 36, 700)
+          height: Math.min(parent.height - 36, 500)
           radius: OmaTheme.cornerRadius
           color: OmaTheme.surface
           border.width: 1
@@ -1734,19 +1960,25 @@ ShellRoot {
             anchors.margins: 16
             spacing: 12
 
-            // Header
+            // Header + Switcher: Critical Path vs Slowest Units
             Item {
               width: parent.width
-              height: 24
+              height: 26
 
-              Text {
+              Row {
                 anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                text: "BOOT BREAKDOWN"
-                font.family: OmaTheme.fontFamily
-                font.pixelSize: OmaTheme.fontSubtitle
-                font.bold: true
-                color: OmaTheme.foreground
+                spacing: 0
+
+                OmaButton {
+                  text: "CRITICAL PATH"
+                  active: app.bootTab === "chain"
+                  onClicked: app.bootTab = "chain"
+                }
+                OmaButton {
+                  text: "SLOWEST UNITS"
+                  active: app.bootTab === "slowest"
+                  onClicked: app.bootTab = "slowest"
+                }
               }
 
               OmaButton {
@@ -1775,7 +2007,7 @@ ShellRoot {
 
                 delegate: Rectangle {
                   width: (parent.width - 20) / 3
-                  height: 54
+                  height: 52
                   radius: OmaTheme.cornerRadius
                   color: OmaTheme.background
                   border.width: 1
@@ -1880,99 +2112,212 @@ ShellRoot {
 
             Rectangle { width: parent.width; height: 1; color: OmaTheme.hairline }
 
-            // Slowest Startup Units Section
-            Text {
-              text: "SLOWEST STARTUP UNITS"
-              font.family: OmaTheme.fontFamily
-              font.pixelSize: OmaTheme.fontCaption
-              font.bold: true
-              font.letterSpacing: 1.0
-              color: OmaTheme.muted
-            }
-
-            ListView {
-              id: slowestListView
+            // Tab View 1: Critical Path Dependency Tree
+            Column {
+              visible: app.bootTab === "chain"
               width: parent.width
               height: parent.height - 230
-              clip: true
-              boundsBehavior: Flickable.StopAtBounds
-              model: app.slowestUnits
+              spacing: 6
 
-              ScrollBar.vertical: ScrollBar {
-                policy: ScrollBar.AsNeeded
-                width: 4
-                contentItem: Rectangle {
-                  implicitWidth: 4
-                  color: OmaTheme.rgba(OmaTheme.foreground, 0.22)
-                }
+              Text {
+                text: "CRITICAL PATH (Blocking graphical.target in sequence)"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontCaption
+                font.bold: true
+                font.letterSpacing: 1.0
+                color: OmaTheme.muted
               }
 
-              delegate: Rectangle {
-                id: slowUnitRow
-                width: slowestListView.width - 8
-                height: 28
-                radius: OmaTheme.cornerRadius
-                color: slowMouse.containsMouse ? OmaTheme.hoverFill : "transparent"
+              ListView {
+                id: chainListView
+                width: parent.width
+                height: parent.height - 24
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                model: app.criticalChain
 
-                MouseArea {
-                  id: slowMouse
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: {
-                    app.bootModalOpen = false
-                    app.openInspector(modelData)
+                ScrollBar.vertical: ScrollBar {
+                  policy: ScrollBar.AsNeeded
+                  width: 4
+                  contentItem: Rectangle {
+                    implicitWidth: 4
+                    color: OmaTheme.rgba(OmaTheme.foreground, 0.22)
                   }
                 }
 
-                Text {
-                  id: slowTime
-                  anchors.left: parent.left
-                  anchors.leftMargin: 8
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: 60
-                  text: modelData.bootTimeText
-                  font.family: OmaTheme.fontFamily
-                  font.pixelSize: OmaTheme.fontSmall
-                  font.bold: true
-                  color: modelData.bootTimeMs >= 5000 ? OmaTheme.red : OmaTheme.yellow
+                delegate: Rectangle {
+                  width: chainListView.width - 8
+                  height: 26
+                  radius: OmaTheme.cornerRadius
+                  color: chainMouse.containsMouse ? OmaTheme.hoverFill : "transparent"
+
+                  MouseArea {
+                    id: chainMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      app.bootModalOpen = false
+                      var matched = null
+                      for (var mi = 0; mi < app.allItems.length; mi++) {
+                        if (app.allItems[mi].unitName === modelData.unit || app.allItems[mi].name === modelData.unit) {
+                          matched = app.allItems[mi]
+                          break
+                        }
+                      }
+                      if (matched) {
+                        app.openInspector(matched)
+                      } else {
+                        app.toast(modelData.unit + " active @" + modelData.activeAt)
+                      }
+                    }
+                  }
+
+                  Row {
+                    anchors.fill: parent
+                    anchors.leftMargin: Math.min(180, modelData.indent * 8 + 8)
+                    anchors.rightMargin: 8
+                    spacing: 8
+
+                    Text {
+                      text: modelData.indent > 0 ? "└─" : "●"
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontCaption
+                      color: OmaTheme.accent
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      text: modelData.unit
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontSmall
+                      font.bold: modelData.unit.indexOf(".target") < 0
+                      color: modelData.unit.indexOf(".target") >= 0 ? OmaTheme.muted : OmaTheme.foreground
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      text: "@" + modelData.activeAt
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontCaption
+                      color: OmaTheme.dim
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      visible: modelData.duration.length > 0
+                      text: "+" + modelData.duration
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontSmall
+                      font.bold: true
+                      color: OmaTheme.yellow
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+              }
+            }
+
+            // Tab View 2: Slowest Startup Units
+            Column {
+              visible: app.bootTab === "slowest"
+              width: parent.width
+              height: parent.height - 230
+              spacing: 6
+
+              Text {
+                text: "SLOWEST STARTUP UNITS (Total boot time taken)"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontCaption
+                font.bold: true
+                font.letterSpacing: 1.0
+                color: OmaTheme.muted
+              }
+
+              ListView {
+                id: slowestListView
+                width: parent.width
+                height: parent.height - 24
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                model: app.slowestUnits
+
+                ScrollBar.vertical: ScrollBar {
+                  policy: ScrollBar.AsNeeded
+                  width: 4
+                  contentItem: Rectangle {
+                    implicitWidth: 4
+                    color: OmaTheme.rgba(OmaTheme.foreground, 0.22)
+                  }
                 }
 
-                Text {
-                  id: slowName
-                  anchors.left: slowTime.right
-                  anchors.leftMargin: 10
-                  anchors.verticalCenter: parent.verticalCenter
-                  width: Math.min(implicitWidth, 220)
-                  elide: Text.ElideRight
-                  text: modelData.name
-                  font.family: OmaTheme.fontFamily
-                  font.pixelSize: OmaTheme.fontBody
-                  color: OmaTheme.foreground
-                }
+                delegate: Rectangle {
+                  id: slowUnitRow
+                  width: slowestListView.width - 8
+                  height: 28
+                  radius: OmaTheme.cornerRadius
+                  color: slowMouse.containsMouse ? OmaTheme.hoverFill : "transparent"
 
-                Text {
-                  anchors.left: slowName.right
-                  anchors.leftMargin: 12
-                  anchors.right: slowInspectHint.left
-                  anchors.rightMargin: 10
-                  anchors.verticalCenter: parent.verticalCenter
-                  elide: Text.ElideRight
-                  text: modelData.description || modelData.command
-                  font.family: OmaTheme.fontFamily
-                  font.pixelSize: OmaTheme.fontSmall
-                  color: OmaTheme.faint
-                }
+                  MouseArea {
+                    id: slowMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                      app.bootModalOpen = false
+                      app.openInspector(modelData)
+                    }
+                  }
 
-                Text {
-                  id: slowInspectHint
-                  anchors.right: parent.right
-                  anchors.rightMargin: 8
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "inspect →"
-                  font.family: OmaTheme.fontFamily
-                  font.pixelSize: OmaTheme.fontCaption
-                  color: slowMouse.containsMouse ? OmaTheme.accent : OmaTheme.dim
+                  Text {
+                    id: slowTime
+                    anchors.left: parent.left
+                    anchors.leftMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 60
+                    text: modelData.bootTimeText
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontSmall
+                    font.bold: true
+                    color: modelData.bootTimeMs >= 5000 ? OmaTheme.red : OmaTheme.yellow
+                  }
+
+                  Text {
+                    id: slowName
+                    anchors.left: slowTime.right
+                    anchors.leftMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Math.min(implicitWidth, 220)
+                    elide: Text.ElideRight
+                    text: modelData.name
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontBody
+                    color: OmaTheme.foreground
+                  }
+
+                  Text {
+                    anchors.left: slowName.right
+                    anchors.leftMargin: 12
+                    anchors.right: slowInspectHint.left
+                    anchors.rightMargin: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    elide: Text.ElideRight
+                    text: modelData.description || modelData.command
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontSmall
+                    color: OmaTheme.faint
+                  }
+
+                  Text {
+                    id: slowInspectHint
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "inspect →"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    color: slowMouse.containsMouse ? OmaTheme.accent : OmaTheme.dim
+                  }
                 }
               }
             }
@@ -2398,6 +2743,268 @@ ShellRoot {
                     app.runBackendAction("toggle", { item: target, enable: false })
                   }
                 }
+              }
+            }
+          }
+        }
+      }
+
+      // ======================================================================
+      // MODAL 5: HWiNFO-Style Launch Mode Selection Dialog
+      // ======================================================================
+      Rectangle {
+        anchors.fill: parent
+        visible: app.modePromptOpen
+        color: OmaTheme.scrim
+        z: 50
+
+        Rectangle {
+          id: modeDialogCard
+          anchors.centerIn: parent
+          width: Math.min(parent.width - 40, 620)
+          height: 320
+          radius: OmaTheme.cornerRadius
+          color: OmaTheme.surface
+          border.width: 1
+          border.color: OmaTheme.accent
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: 20
+            spacing: 16
+
+            // Header
+            Column {
+              width: parent.width
+              spacing: 4
+
+              Text {
+                text: "SELECT STARTUP VIEW"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSubtitle
+                font.bold: true
+                font.letterSpacing: 1.2
+                color: OmaTheme.foreground
+              }
+
+              Text {
+                text: "Choose what you want to manage. You can switch anytime using the header toggle or 'm'."
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSmall
+                color: OmaTheme.muted
+              }
+            }
+
+            // Two Cards Side-by-Side
+            Row {
+              width: parent.width
+              height: 140
+              spacing: 12
+
+              // Card 1: APPLICATIONS
+              Rectangle {
+                id: appsCard
+                width: (parent.width - 12) / 2
+                height: parent.height
+                radius: OmaTheme.cornerRadius
+                color: app.selectedLaunchMode === "apps" ? OmaTheme.hoverFill : OmaTheme.background
+                border.width: app.selectedLaunchMode === "apps" ? 2 : 1
+                border.color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.hairline
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: app.selectedLaunchMode = "apps"
+                  onDoubleClicked: {
+                    app.selectedLaunchMode = "apps"
+                    app.confirmLaunchMode()
+                  }
+                }
+
+                Column {
+                  anchors.fill: parent
+                  anchors.margins: 14
+                  spacing: 6
+
+                  Row {
+                    width: parent.width
+                    spacing: 8
+
+                    Rectangle {
+                      width: 20
+                      height: 20
+                      radius: 3
+                      color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.elevated
+                      Text {
+                        anchors.centerIn: parent
+                        text: "1"
+                        font.family: OmaTheme.fontFamily
+                        font.pixelSize: OmaTheme.fontCaption
+                        font.bold: true
+                        color: OmaTheme.foreground
+                      }
+                    }
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "APPLICATIONS"
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontBody
+                      font.bold: true
+                      color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.foreground
+                    }
+                  }
+
+                  Text {
+                    text: "Desktop Apps & Autostart"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    color: OmaTheme.muted
+                  }
+
+                  Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: "Manage user programs, bars, and scripts that launch when you log in (Hyprland, XDG desktop autostarts, user hooks)."
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontSmall
+                    color: OmaTheme.dim
+                  }
+                }
+              }
+
+              // Card 2: SYSTEM & SERVICES
+              Rectangle {
+                id: systemCard
+                width: (parent.width - 12) / 2
+                height: parent.height
+                radius: OmaTheme.cornerRadius
+                color: app.selectedLaunchMode === "system" ? OmaTheme.hoverFill : OmaTheme.background
+                border.width: app.selectedLaunchMode === "system" ? 2 : 1
+                border.color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.hairline
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: app.selectedLaunchMode = "system"
+                  onDoubleClicked: {
+                    app.selectedLaunchMode = "system"
+                    app.confirmLaunchMode()
+                  }
+                }
+
+                Column {
+                  anchors.fill: parent
+                  anchors.margins: 14
+                  spacing: 6
+
+                  Row {
+                    width: parent.width
+                    spacing: 8
+
+                    Rectangle {
+                      width: 20
+                      height: 20
+                      radius: 3
+                      color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.elevated
+                      Text {
+                        anchors.centerIn: parent
+                        text: "2"
+                        font.family: OmaTheme.fontFamily
+                        font.pixelSize: OmaTheme.fontCaption
+                        font.bold: true
+                        color: OmaTheme.foreground
+                      }
+                    }
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "SYSTEM & SERVICES"
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontBody
+                      font.bold: true
+                      color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.foreground
+                    }
+                  }
+
+                  Text {
+                    text: "Full Daemons & Diagnostics"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    color: OmaTheme.muted
+                  }
+
+                  Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: "Systemd background daemons, socket activations, timers, boot bottleneck analysis, and journal logs."
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontSmall
+                    color: OmaTheme.dim
+                  }
+                }
+              }
+            }
+
+            // Bottom Row: Remember Checkbox + Launch Button
+            Item {
+              width: parent.width
+              height: 32
+
+              Row {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 8
+
+                Rectangle {
+                  width: 16
+                  height: 16
+                  radius: 3
+                  color: app.rememberModeChoice ? OmaTheme.accent : OmaTheme.elevated
+                  border.width: 1
+                  border.color: app.rememberModeChoice ? OmaTheme.accent : OmaTheme.normalBorder
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    visible: app.rememberModeChoice
+                    anchors.centerIn: parent
+                    text: "✓"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    font.bold: true
+                    color: OmaTheme.background
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: app.rememberModeChoice = !app.rememberModeChoice
+                  }
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "Remember my choice (don't prompt on launch)"
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSmall
+                  color: OmaTheme.muted
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: app.rememberModeChoice = !app.rememberModeChoice
+                  }
+                }
+              }
+
+              OmaButton {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "LAUNCH · ENTER"
+                accentStyle: true
+                onClicked: app.confirmLaunchMode()
               }
             }
           }

@@ -29,6 +29,7 @@ def _handle_backend(subcmd: str, payload_raw: str) -> int:
             "rawBreakdown": s.raw_breakdown,
             "stages": s.stages,
             "slowestUnits": s.slowest_units,
+            "criticalChain": s.critical_chain,
             "items": [i.to_ui_dict() for i in s.items],
         }
         print(json.dumps(out, ensure_ascii=False))
@@ -108,6 +109,46 @@ def _handle_backend(subcmd: str, payload_raw: str) -> int:
         print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
         return 0
 
+    if subcmd == "mask":
+        from omarchy_startup.actions import mask_item_raw
+
+        ok, msg = mask_item_raw(data.get("item", {}))
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+        return 0
+
+    if subcmd == "settings-get":
+        from omarchy_startup.actions import get_settings_raw
+
+        print(json.dumps(get_settings_raw(), ensure_ascii=False))
+        return 0
+
+    if subcmd == "settings-set":
+        from omarchy_startup.actions import save_settings_raw
+
+        ok, msg = save_settings_raw(data)
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+        return 0
+
+    if subcmd == "snapshot-save":
+        from omarchy_startup.actions import save_snapshot_raw
+
+        ok, msg = save_snapshot_raw(data.get("name", ""))
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+        return 0
+
+    if subcmd == "snapshot-list":
+        from omarchy_startup.actions import list_snapshots_raw
+
+        print(json.dumps({"snapshots": list_snapshots_raw()}, ensure_ascii=False))
+        return 0
+
+    if subcmd == "snapshot-restore":
+        from omarchy_startup.actions import restore_snapshot_raw
+
+        ok, msg = restore_snapshot_raw(data.get("id", ""))
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+        return 0
+
     print(json.dumps({"ok": False, "message": f"Unknown command: {subcmd}"}))
     return 1
 
@@ -133,6 +174,16 @@ def main() -> int:
         help="Output startup state as JSON",
     )
     parser.add_argument(
+        "--critical-chain",
+        action="store_true",
+        help="Print the systemd critical-chain dependency tree",
+    )
+    parser.add_argument(
+        "cmd_args",
+        nargs="*",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--backend",
         metavar="CMD",
         help=argparse.SUPPRESS,
@@ -147,6 +198,57 @@ def main() -> int:
 
     if args.backend:
         return _handle_backend(args.backend, args.payload)
+
+    # CLI subcommands: snapshot, critical-chain
+    cmd_tokens = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if cmd_tokens:
+        primary = cmd_tokens[0]
+        if primary == "critical-chain":
+            args.critical_chain = True
+        elif primary == "snapshot":
+            from omarchy_startup.actions import (
+                list_snapshots_raw,
+                restore_snapshot_raw,
+                save_snapshot_raw,
+            )
+
+            sub = cmd_tokens[1] if len(cmd_tokens) > 1 else "list"
+            if sub == "save":
+                name = cmd_tokens[2] if len(cmd_tokens) > 2 else ""
+                ok, msg = save_snapshot_raw(name)
+                print(msg)
+                return 0 if ok else 1
+            elif sub == "restore":
+                if len(cmd_tokens) < 3:
+                    print("Usage: omastart snapshot restore <snapshot_id>")
+                    return 1
+                ok, msg = restore_snapshot_raw(cmd_tokens[2])
+                print(msg)
+                return 0 if ok else 1
+            elif sub == "list":
+                snaps = list_snapshots_raw()
+                if not snaps:
+                    print("No snapshots found in ~/.config/omastart/snapshots/")
+                    return 0
+                print(f"{'ID':<24} {'LABEL':<24} {'ITEMS':<8} {'TIMESTAMP'}")
+                print("-" * 72)
+                for s in snaps:
+                    print(
+                        f"{s['id']:<24} {s['label']:<24} {s['itemCount']:<8} {s['timestamp']}"
+                    )
+                return 0
+
+    if args.critical_chain:
+        from omarchy_startup.collector import _collect_critical_chain
+
+        tree = _collect_critical_chain()
+        if not tree:
+            print("No critical-chain data available from systemd.")
+            return 1
+        for node in tree:
+            dur = f" (+{node['duration']})" if node["duration"] else ""
+            print(f"{'  ' * (node['indent'] // 2)}{node['unit']} @{node['activeAt']}{dur}")
+        return 0
 
     if args.list or args.json:
         from omarchy_startup.collector import collect_all_startup_data

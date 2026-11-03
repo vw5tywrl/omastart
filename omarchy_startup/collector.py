@@ -162,6 +162,32 @@ def _collect_boot_summary() -> BootSummary:
     return summary
 
 
+def _collect_critical_chain() -> list[dict[str, object]]:
+    rc, out, _ = _run_cmd(["systemd-analyze", "critical-chain", "--no-pager"], timeout=4.0)
+    if rc != 0 or not out.strip():
+        return []
+    tree: list[dict[str, object]] = []
+    for line in out.strip().splitlines():
+        if "@" not in line:
+            continue
+        cleaned = re.sub(r"^\s*(?:└─|├─|│|`[-─]|\+[-─]|[-─]{1,2})\s*", "", line)
+        m = re.match(r"^([a-zA-Z0-9_.\-@]+)\s+@([0-9a-zA-Z.]+)(?:\s+\+([0-9a-zA-Z.]+))?", cleaned)
+        if m:
+            unit = m.group(1)
+            active_at = m.group(2)
+            dur = m.group(3) or ""
+            prefix = line[:line.find(unit)] if unit in line else ""
+            indent = len(prefix.replace("└─", "  ").replace("├─", "  ").replace("│ ", "  "))
+            tree.append({
+                "unit": unit,
+                "activeAt": active_at,
+                "duration": dur,
+                "indent": indent,
+                "raw": line.strip(),
+            })
+    return tree
+
+
 def _collect_running_processes() -> list[tuple[int, str, str]]:
     rc, out, _ = _run_cmd(["ps", "-eo", "pid=,comm=,args="], timeout=3.0)
     procs: list[tuple[int, str, str]] = []
@@ -237,6 +263,19 @@ def _resolve_binary_path(command: str) -> str:
     if exe.startswith("/"):
         return exe if os.path.exists(exe) else ""
     return shutil.which(exe) or ""
+
+
+def _is_executable_uninstalled(command: str, bin_path: str) -> bool:
+    exe = _extract_first_executable(command)
+    if not exe:
+        return False
+    if bin_path and os.path.exists(bin_path):
+        return False
+    if exe in {"sh", "bash", "zsh", "systemctl", "exec", "source", "."}:
+        return False
+    if "/" in exe:
+        return not os.path.exists(os.path.expanduser(exe))
+    return shutil.which(exe) is None
 
 
 def _read_omarchy_script_summary(binary_path: str) -> str:
@@ -400,6 +439,8 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
                     pid=pid,
                     read_only=True,
                     read_only_reason="Managed by Omarchy (/usr/share/omarchy/ is read-only across updates).",
+                    is_uninstalled=_is_executable_uninstalled(cmd, bin_path),
+                    trigger_type="login",
                     line_number=idx,
                     raw_line=line,
                     extra_meta={"hypr_format": "lua"},
@@ -460,6 +501,8 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
                     pid=pid,
                     read_only=False,
                     can_delete=True,
+                    is_uninstalled=_is_executable_uninstalled(cmd, bin_path),
+                    trigger_type="login",
                     line_number=idx,
                     raw_line=line,
                     extra_meta={"hypr_format": "lua"},
@@ -558,6 +601,8 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
                         pid=pid,
                         read_only=is_sys_read_only,
                         can_delete=not is_sys_read_only,
+                        is_uninstalled=_is_executable_uninstalled(clean_exec_cmd, bin_path),
+                        trigger_type="login",
                         line_number=idx,
                         raw_line=line,
                         extra_meta={"hypr_format": "conf"},
@@ -624,6 +669,8 @@ def _collect_hook_items() -> list[StartupItem]:
                 read_only=False,
                 can_delete=not is_stock_sample,
                 is_vendor_default=is_stock_sample,
+                is_uninstalled=not path.is_file(),
+                trigger_type="hook",
                 extra_meta={"is_stock_sample": "1" if is_stock_sample else "0"},
             )
         )
@@ -726,6 +773,8 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
             read_only=False,
             can_delete=(has_usr and not has_sys),
             is_vendor_default=(not enabled and not has_usr),
+            is_uninstalled=_is_executable_uninstalled(exec_cmd, bin_path),
+            trigger_type="login",
             extra_meta={
                 "desktop_id": desktop_id,
                 "has_sys": "1" if has_sys else "0",
@@ -1006,6 +1055,13 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
             and not _has_user_or_etc_override(unit_name, user)
         )
 
+        if unit_name.endswith(".socket") or bool(triggered_by):
+            t_type = "on-demand"
+        elif unit_name.endswith(".timer"):
+            t_type = "scheduled"
+        else:
+            t_type = "boot"
+
         items.append(
             StartupItem(
                 id=f"{source.value}:{unit_name}",
@@ -1025,6 +1081,8 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
                 is_critical=(unit_name in CRITICAL_UNITS),
                 is_masked=is_masked,
                 is_vendor_default=is_vendor_default,
+                is_uninstalled=False,
+                trigger_type=t_type,
                 triggered_by=triggered_by,
                 extra_meta={
                     "unit_state": u_state,
@@ -1192,6 +1250,7 @@ def collect_all_startup_data() -> BootSummary:
         }
         for it in timed[:8]
     ]
+    summary.critical_chain = _collect_critical_chain()
     return summary
 
 

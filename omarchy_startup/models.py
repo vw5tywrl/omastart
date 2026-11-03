@@ -93,6 +93,8 @@ class StartupItem:
     is_critical: bool = False
     is_masked: bool = False
     is_vendor_default: bool = False
+    is_uninstalled: bool = False
+    trigger_type: str = "boot"
     triggered_by: str = ""
     line_number: Optional[int] = None
     raw_line: str = ""
@@ -147,6 +149,8 @@ class StartupItem:
             "isCritical": self.is_critical,
             "isMasked": self.is_masked,
             "isVendorDefault": self.is_vendor_default,
+            "isUninstalled": self.is_uninstalled,
+            "triggerType": self.trigger_type,
             "triggeredBy": self.triggered_by,
             "lineNumber": self.line_number or 0,
             "extraMeta": self.extra_meta,
@@ -161,4 +165,5 @@ class BootSummary:
     raw_breakdown: str = ""
     stages: list[dict[str, object]] = field(default_factory=list)
     slowest_units: list[dict[str, object]] = field(default_factory=list)
+    critical_chain: list[dict[str, object]] = field(default_factory=list)
     items: list[StartupItem] = field(default_factory=list)

@@ -154,6 +154,13 @@ def _handle_backend(subcmd: str, payload_raw: str) -> int:
 
 
 def main() -> int:
+    # Dedicated fast-path for Quickshell backend calls
+    if "--backend" in sys.argv:
+        idx = sys.argv.index("--backend")
+        subcmd = sys.argv[idx + 1] if len(sys.argv) > idx + 1 else ""
+        payload = sys.argv[idx + 2] if len(sys.argv) > idx + 2 else ""
+        return _handle_backend(subcmd, payload)
+
     parser = argparse.ArgumentParser(
         prog="omarchy-startup",
         description="Dead-simple startup package and service manager for Omarchy.",
@@ -178,26 +185,7 @@ def main() -> int:
         action="store_true",
         help="Print the systemd critical-chain dependency tree",
     )
-    parser.add_argument(
-        "cmd_args",
-        nargs="*",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "--backend",
-        metavar="CMD",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
-        "payload",
-        nargs="?",
-        default="",
-        help=argparse.SUPPRESS,
-    )
     args = parser.parse_args()
-
-    if args.backend:
-        return _handle_backend(args.backend, args.payload)
 
     # CLI subcommands: snapshot, critical-chain
     cmd_tokens = [a for a in sys.argv[1:] if not a.startswith("-")]

@@ -224,6 +224,9 @@ ShellRoot {
     id: actionProc
     property var argsList: []
     command: argsList
+    onExited: function(exitCode, exitStatus) {
+      app.busyAction = false
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -751,9 +754,10 @@ ShellRoot {
         // Header
         Column {
           width: parent.width
-          spacing: 4
+          spacing: 6
 
           Text {
+            anchors.horizontalCenter: parent.horizontalCenter
             text: "SELECT STARTUP MODE"
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontSubtitle
@@ -763,6 +767,10 @@ ShellRoot {
           }
 
           Text {
+            anchors.horizontalCenter: parent.horizontalCenter
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
             text: "Choose what you want to manage. You can switch anytime using the header toggle or 'm'."
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontSmall

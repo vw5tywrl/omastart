@@ -2,9 +2,19 @@
 
 Startup manager for Omarchy and Arch Linux (Hyprland).
 
-Aggregates systemd units, Hyprland autostart commands, and Omarchy post-boot hooks into a single interface.
+Aggregates desktop autostart applications, systemd units, Hyprland autostart commands, and Omarchy post-boot hooks into a fast, native interface.
 
-![omastart preview](assets/screenshots/preview.png)
+![Mode Selection Dialog](assets/screenshots/preview_prompt.png)
+
+### Basic Mode
+Clean, dead-simple startup application manager for desktop programs, bars, and user autostarts.
+
+![Basic Mode preview](assets/screenshots/preview.png)
+
+### Advanced Mode
+Full system diagnostics, systemd background daemons, socket activations, timers, boot bottleneck analysis, and journal logs.
+
+![Advanced Mode preview](assets/screenshots/preview_system.png)
 
 ## Requirements
 
@@ -40,7 +50,7 @@ Run `omastart` from terminal or your application launcher.
 
 - `j` / `k` or `Up` / `Down`: navigate
 - `Space`: toggle service
-- `m`: toggle between Applications and System & Services views
+- `m`: toggle between Basic Mode and Advanced Mode
 - `u`: undo last toggle
 - `Enter`: inspect service details and logs
 - `e`: open config file in `$EDITOR` at exact line

@@ -9,7 +9,9 @@ ShellRoot {
 
   readonly property string backendBin: Quickshell.env("OMARCHY_STARTUP_BIN") || (Quickshell.env("HOME") + "/.local/bin/omarchy-startup")
 
-  // Mode state: "apps" (simple desktop apps) | "system" (advanced system services & daemons)
+  property bool initialized: false
+
+  // Mode state: "apps" (Basic Mode) | "system" (Advanced Mode)
   property string currentMode: "apps"
   property string selectedLaunchMode: "apps"
   property bool modePromptOpen: false
@@ -49,6 +51,7 @@ ShellRoot {
 
   // Counts
   property int countEnabled: 0
+  property int countDisabled: 0
   property int countPackages: 0
   property int countRunning: 0
   property int countFailed: 0
@@ -77,6 +80,28 @@ ShellRoot {
     interval: 4000
     repeat: false
     onTriggered: app.statusMessage = ""
+  }
+
+  readonly property string screenshotDest: Quickshell.env("OMASTART_SCREENSHOT_DEST") || ""
+
+  Timer {
+    id: screenshotTimer
+    interval: 600
+    running: app.screenshotDest.length > 0 && !app.loading
+    repeat: false
+    onTriggered: {
+      if (app.modePromptOpen && promptWin.visible) {
+        promptRootScope.grabToImage(function(result) {
+          result.saveToFile(app.screenshotDest)
+          Qt.quit()
+        })
+      } else if (win.visible) {
+        rootScope.grabToImage(function(result) {
+          result.saveToFile(app.screenshotDest)
+          Qt.quit()
+        })
+      }
+    }
   }
 
   Timer {
@@ -128,25 +153,67 @@ ShellRoot {
     }
   }
 
+  property FileView settingsFileView: FileView {
+    path: Quickshell.env("HOME") + "/.config/omastart/settings.json"
+    printErrors: false
+    onLoaded: {
+      if (app.initialized) return
+      try {
+        var s = JSON.parse(text())
+        if (s.rememberMode && s.mode) {
+          app.currentMode = s.mode
+          app.modePromptOpen = false
+        } else {
+          app.currentMode = s.mode || "apps"
+          app.selectedLaunchMode = app.currentMode
+          app.modePromptOpen = true
+        }
+      } catch (e) {
+        app.modePromptOpen = true
+      }
+      app.initialized = true
+      app.recomputeMetrics()
+      app.rebuildRows()
+    }
+  }
+
   Process {
     id: settingsProc
     command: [app.backendBin, "--backend", "settings-get"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try {
-          var s = JSON.parse(String(text || "{}"))
-          if (s.rememberMode && s.mode) {
-            app.currentMode = s.mode
-            app.modePromptOpen = false
-          } else {
-            app.currentMode = s.mode || "apps"
-            app.selectedLaunchMode = app.currentMode
+        if (!app.initialized) {
+          try {
+            var s = JSON.parse(String(text || "{}"))
+            if (s.rememberMode && s.mode) {
+              app.currentMode = s.mode
+              app.modePromptOpen = false
+            } else {
+              app.currentMode = s.mode || "apps"
+              app.selectedLaunchMode = app.currentMode
+              app.modePromptOpen = true
+            }
+          } catch (e) {
             app.modePromptOpen = true
           }
-        } catch (e) {
-          app.modePromptOpen = true
+          app.initialized = true
         }
+        app.recomputeMetrics()
+        app.rebuildRows()
+      }
+    }
+  }
+
+  Timer {
+    id: initFallbackTimer
+    interval: 250
+    running: !app.initialized
+    repeat: false
+    onTriggered: {
+      if (!app.initialized) {
+        app.modePromptOpen = true
+        app.initialized = true
         app.recomputeMetrics()
         app.rebuildRows()
       }
@@ -324,9 +391,10 @@ ShellRoot {
 
   function isItemInActiveMode(it) {
     if (currentMode === "apps") {
+      // Basic Mode: show only user autostart applications; hide internal read-only OS bootstrap scripts
+      if (it.readOnly) return false
       return (
         it.source === "hyprland-user" ||
-        it.source === "hyprland-default" ||
         it.source === "xdg-autostart" ||
         it.source === "hook-post-boot"
       )
@@ -336,6 +404,7 @@ ShellRoot {
 
   function recomputeMetrics() {
     var enabledCnt = 0
+    var disabledCnt = 0
     var runningCnt = 0
     var failedCnt = 0
     var pkgSet = ({})
@@ -349,6 +418,8 @@ ShellRoot {
         enabledCnt++
         if (it.pkgName) pkgSet[it.pkgName] = true
         if (it.runningState === "running") runningCnt++
+      } else {
+        disabledCnt++
       }
       if (it.runningState === "failed") {
         failedCnt++
@@ -359,6 +430,7 @@ ShellRoot {
       }
     }
     countEnabled = enabledCnt
+    countDisabled = disabledCnt
     countPackages = Object.keys(pkgSet).length
     countRunning = runningCnt
     countFailed = failedCnt
@@ -413,7 +485,48 @@ ShellRoot {
       for (var f = 0; f < filtered.length; f++) {
         rows.push({ kind: "item", item: filtered[f] })
       }
-    } else if (viewMode === "packages" || currentMode === "apps") {
+    } else if (currentMode === "apps") {
+      // Basic Mode: dead-simple layout organized by Enabled and Disabled apps
+      var enabledApps = []
+      var disabledApps = []
+      for (var b = 0; b < filtered.length; b++) {
+        if (filtered[b].enabled) {
+          enabledApps.push(filtered[b])
+        } else {
+          disabledApps.push(filtered[b])
+        }
+      }
+
+      if (sortMode === 1) {
+        enabledApps.sort(function(a, b) { return (b.bootTimeMs || 0) - (a.bootTimeMs || 0) })
+        disabledApps.sort(function(a, b) { return (b.bootTimeMs || 0) - (a.bootTimeMs || 0) })
+      } else {
+        enabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
+        disabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
+      }
+
+      if (enabledApps.length > 0) {
+        rows.push({
+          kind: "header",
+          title: "ENABLED AT LOGIN  ·  " + enabledApps.length,
+          rightMeta: "Launches automatically on login"
+        })
+        for (var eb = 0; eb < enabledApps.length; eb++) {
+          rows.push({ kind: "item", item: enabledApps[eb] })
+        }
+      }
+
+      if (disabledApps.length > 0 && (app.showDisabled || q.length > 0)) {
+        rows.push({
+          kind: "header",
+          title: "DISABLED  ·  " + disabledApps.length,
+          rightMeta: "Toggle switch to re-enable"
+        })
+        for (var db = 0; db < disabledApps.length; db++) {
+          rows.push({ kind: "item", item: disabledApps[db] })
+        }
+      }
+    } else if (viewMode === "packages") {
       var groups = ({})
       for (var p = 0; p < filtered.length; p++) {
         var item = filtered[p]
@@ -587,7 +700,297 @@ ShellRoot {
     settingsProc.running = true
   }
 
-  // ---- Main Window ----------------------------------------------------------
+  // ---- Mode Selection Floating Window (HWiNFO style) -----------------------
+  FloatingWindow {
+    id: promptWin
+    title: "Select Startup Mode"
+    color: OmaTheme.background
+    implicitWidth: 680
+    implicitHeight: 370
+    visible: app.initialized && app.modePromptOpen
+
+    onVisibleChanged: {
+      if (!visible && app.modePromptOpen) Qt.quit()
+    }
+
+    FocusScope {
+      id: promptRootScope
+      anchors.fill: parent
+      focus: true
+
+      Rectangle {
+        anchors.fill: parent
+        color: OmaTheme.background
+        z: -10
+      }
+
+      Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_1 || event.key === Qt.Key_Left || event.key === Qt.Key_H) {
+          app.selectedLaunchMode = "apps"
+          event.accepted = true
+        } else if (event.key === Qt.Key_2 || event.key === Qt.Key_Right || event.key === Qt.Key_L) {
+          app.selectedLaunchMode = "system"
+          event.accepted = true
+        } else if (event.key === Qt.Key_Space) {
+          app.rememberModeChoice = !app.rememberModeChoice
+          event.accepted = true
+        } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+          app.confirmLaunchMode()
+          event.accepted = true
+        } else if (event.key === Qt.Key_Escape || event.key === Qt.Key_Q) {
+          Qt.quit()
+          event.accepted = true
+        }
+      }
+
+      Column {
+        anchors.fill: parent
+        anchors.margins: 22
+        spacing: 16
+
+        // Header
+        Column {
+          width: parent.width
+          spacing: 4
+
+          Text {
+            text: "SELECT STARTUP MODE"
+            font.family: OmaTheme.fontFamily
+            font.pixelSize: OmaTheme.fontSubtitle
+            font.bold: true
+            font.letterSpacing: 1.2
+            color: OmaTheme.foreground
+          }
+
+          Text {
+            text: "Choose what you want to manage. You can switch anytime using the header toggle or 'm'."
+            font.family: OmaTheme.fontFamily
+            font.pixelSize: OmaTheme.fontSmall
+            color: OmaTheme.muted
+          }
+        }
+
+        // Two Cards Side-by-Side
+        Row {
+          width: parent.width
+          height: 180
+          spacing: 14
+
+          // Card 1: BASIC MODE
+          Rectangle {
+            id: appsCard
+            width: (parent.width - 14) / 2
+            height: parent.height
+            radius: OmaTheme.cornerRadius
+            color: app.selectedLaunchMode === "apps" ? OmaTheme.hoverFill : OmaTheme.surface
+            border.width: app.selectedLaunchMode === "apps" ? 2 : 1
+            border.color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.hairline
+            clip: true
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: app.selectedLaunchMode = "apps"
+              onDoubleClicked: {
+                app.selectedLaunchMode = "apps"
+                app.confirmLaunchMode()
+              }
+            }
+
+            Column {
+              anchors.fill: parent
+              anchors.margins: 16
+              spacing: 6
+
+              Row {
+                width: parent.width
+                spacing: 8
+
+                Rectangle {
+                  width: 22
+                  height: 22
+                  radius: OmaTheme.cornerRadius
+                  color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.elevated
+                  Text {
+                    anchors.centerIn: parent
+                    text: "1"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    font.bold: true
+                    color: OmaTheme.foreground
+                  }
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "BASIC MODE"
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSubtitle
+                  font.bold: true
+                  color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.foreground
+                }
+              }
+
+              Text {
+                text: "Desktop Apps & Autostart"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontCaption
+                color: OmaTheme.muted
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                lineHeight: 1.15
+                text: "Manage user programs, bars, and scripts that launch when you log in (Hyprland, XDG desktop autostarts, user hooks)."
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSmall
+                color: OmaTheme.dim
+              }
+            }
+          }
+
+          // Card 2: ADVANCED MODE
+          Rectangle {
+            id: systemCard
+            width: (parent.width - 14) / 2
+            height: parent.height
+            radius: OmaTheme.cornerRadius
+            color: app.selectedLaunchMode === "system" ? OmaTheme.hoverFill : OmaTheme.surface
+            border.width: app.selectedLaunchMode === "system" ? 2 : 1
+            border.color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.hairline
+            clip: true
+
+            MouseArea {
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: app.selectedLaunchMode = "system"
+              onDoubleClicked: {
+                app.selectedLaunchMode = "system"
+                app.confirmLaunchMode()
+              }
+            }
+
+            Column {
+              anchors.fill: parent
+              anchors.margins: 16
+              spacing: 6
+
+              Row {
+                width: parent.width
+                spacing: 8
+
+                Rectangle {
+                  width: 22
+                  height: 22
+                  radius: OmaTheme.cornerRadius
+                  color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.elevated
+                  Text {
+                    anchors.centerIn: parent
+                    text: "2"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    font.bold: true
+                    color: OmaTheme.foreground
+                  }
+                }
+
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "ADVANCED MODE"
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSubtitle
+                  font.bold: true
+                  color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.foreground
+                }
+              }
+
+              Text {
+                text: "Full Daemons & Diagnostics"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontCaption
+                color: OmaTheme.muted
+              }
+
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                lineHeight: 1.15
+                text: "Systemd background daemons, socket activations, timers, boot bottleneck analysis, and journal logs."
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSmall
+                color: OmaTheme.dim
+              }
+            }
+          }
+        }
+
+        // Bottom Row: Remember Checkbox + Launch Button
+        Item {
+          width: parent.width
+          height: 32
+
+          Row {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 8
+
+            Rectangle {
+              width: 16
+              height: 16
+              radius: OmaTheme.cornerRadius
+              color: app.rememberModeChoice ? OmaTheme.accent : OmaTheme.elevated
+              border.width: 1
+              border.color: app.rememberModeChoice ? OmaTheme.accent : OmaTheme.normalBorder
+              anchors.verticalCenter: parent.verticalCenter
+
+              Text {
+                visible: app.rememberModeChoice
+                anchors.centerIn: parent
+                text: "✓"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontCaption
+                font.bold: true
+                color: OmaTheme.background
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: app.rememberModeChoice = !app.rememberModeChoice
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Remember my choice (don't prompt on launch)"
+              font.family: OmaTheme.fontFamily
+              font.pixelSize: OmaTheme.fontSmall
+              color: OmaTheme.muted
+
+              MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: app.rememberModeChoice = !app.rememberModeChoice
+              }
+            }
+          }
+
+          OmaButton {
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: "LAUNCH · ENTER"
+            accentStyle: true
+            onClicked: app.confirmLaunchMode()
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Main Tiled Window ----------------------------------------------------
   FloatingWindow {
     id: win
     title: "Startup"
@@ -595,10 +998,10 @@ ShellRoot {
     implicitWidth: 880
     implicitHeight: 560
     minimumSize: Qt.size(500, 300)
-    visible: true
+    visible: app.initialized && !app.modePromptOpen
 
     onVisibleChanged: {
-      if (!visible) Qt.quit()
+      if (!visible && !app.modePromptOpen) Qt.quit()
     }
 
     FocusScope {
@@ -606,36 +1009,15 @@ ShellRoot {
       anchors.fill: parent
       focus: true
 
-      readonly property bool modalOpen: app.inspectedItem !== null || app.confirmDisableItem !== null || app.addModalOpen || app.bootModalOpen || app.modePromptOpen
+      Rectangle {
+        anchors.fill: parent
+        color: OmaTheme.background
+        z: -10
+      }
+
+      readonly property bool modalOpen: app.inspectedItem !== null || app.confirmDisableItem !== null || app.addModalOpen || app.bootModalOpen
 
       Keys.onPressed: function(event) {
-        // 0. Mode prompt dialog keys
-        if (app.modePromptOpen) {
-          if (event.key === Qt.Key_1) {
-            app.selectedLaunchMode = "apps"
-            event.accepted = true
-          } else if (event.key === Qt.Key_2) {
-            app.selectedLaunchMode = "system"
-            event.accepted = true
-          } else if (event.key === Qt.Key_Left || event.key === Qt.Key_H) {
-            app.selectedLaunchMode = "apps"
-            event.accepted = true
-          } else if (event.key === Qt.Key_Right || event.key === Qt.Key_L) {
-            app.selectedLaunchMode = "system"
-            event.accepted = true
-          } else if (event.key === Qt.Key_Space) {
-            app.rememberModeChoice = !app.rememberModeChoice
-            event.accepted = true
-          } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-            app.confirmLaunchMode()
-            event.accepted = true
-          } else if (event.key === Qt.Key_Escape) {
-            app.confirmLaunchMode()
-            event.accepted = true
-          }
-          return
-        }
-
         // 1. Confirm modal keys
         if (app.confirmDisableItem !== null) {
           if (event.key === Qt.Key_Escape || event.key === Qt.Key_N) {
@@ -816,7 +1198,7 @@ ShellRoot {
           app.currentMode = (app.currentMode === "apps") ? "system" : "apps"
           app.recomputeMetrics()
           app.rebuildRows()
-          app.toast("Switched to " + (app.currentMode === "apps" ? "Applications" : "System & Services") + " view")
+          app.toast("Switched to " + (app.currentMode === "apps" ? "Basic Mode" : "Advanced Mode"))
           event.accepted = true
         } else if (event.key === Qt.Key_B) {
           app.bootModalOpen = !app.bootModalOpen
@@ -918,11 +1300,11 @@ ShellRoot {
               }
             }
 
-            // Mode switcher: APPS vs SYSTEM
+            // Mode switcher: BASIC vs ADVANCED
             Row {
               spacing: 0
               OmaButton {
-                text: "APPS"
+                text: "BASIC"
                 active: app.currentMode === "apps"
                 onClicked: {
                   app.currentMode = "apps"
@@ -931,7 +1313,7 @@ ShellRoot {
                 }
               }
               OmaButton {
-                text: "SYSTEM"
+                text: "ADVANCED"
                 active: app.currentMode === "system"
                 onClicked: {
                   app.currentMode = "system"
@@ -958,7 +1340,9 @@ ShellRoot {
             }
 
             OmaButton {
-              text: "DISABLED"
+              text: app.currentMode === "apps"
+                ? ("DISABLED" + (app.countDisabled > 0 ? " (" + app.countDisabled + ")" : ""))
+                : "DISABLED"
               active: app.showDisabled
               onClicked: {
                 app.showDisabled = !app.showDisabled
@@ -987,7 +1371,7 @@ ShellRoot {
             text: {
               if (app.loading) return "scanning..."
               if (app.currentMode === "apps") {
-                return app.countEnabled + " apps launch at login  ·  " + app.countPackages + " pkgs"
+                return app.countEnabled + " apps launch at login"
               }
               if (width >= 320) {
                 return app.countEnabled + " enabled  ·  " + app.countPackages + " pkgs  ·  " +
@@ -1000,16 +1384,16 @@ ShellRoot {
             }
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontSmall
-            color: statsMouse.containsMouse ? OmaTheme.accent : OmaTheme.muted
+            color: (statsMouse.containsMouse && app.currentMode === "system") ? OmaTheme.accent : OmaTheme.muted
 
             MouseArea {
               id: statsMouse
               anchors.fill: parent
               hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onEntered: if (app.bootRaw) app.statusMessage = "Click for boot breakdown (or press 'b')"
+              cursorShape: app.currentMode === "system" ? Qt.PointingHandCursor : Qt.ArrowCursor
+              onEntered: if (app.bootRaw && app.currentMode === "system") app.statusMessage = "Click for boot breakdown (or press 'b')"
               onExited: app.statusMessage = ""
-              onClicked: app.bootModalOpen = true
+              onClicked: if (app.currentMode === "system") app.bootModalOpen = true
             }
           }
         }
@@ -1020,8 +1404,9 @@ ShellRoot {
         Item {
           id: filterBar
           width: parent.width
-          readonly property bool wrapLegend: (width - 36) < (scopeRow.implicitWidth + legendInlineRow.implicitWidth + 20)
-          height: wrapLegend ? 88 : 66
+          readonly property bool isBasic: app.currentMode === "apps"
+          readonly property bool wrapLegend: !isBasic && ((width - 36) < (scopeRow.implicitWidth + legendInlineRow.implicitWidth + 20))
+          height: isBasic ? 42 : (wrapLegend ? 88 : 66)
 
           readonly property var legendModel: [
             { glyph: "●", label: "active",   col: OmaTheme.green },
@@ -1087,7 +1472,7 @@ ShellRoot {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
                     visible: filterInput.text.length === 0 && !filterInput.activeFocus
-                    text: app.currentMode === "apps" ? "Filter startup applications..." : "Filter packages, units, binaries..."
+                    text: app.currentMode === "apps" ? "Search startup applications..." : "Filter packages, units, binaries..."
                     font.family: OmaTheme.fontFamily
                     font.pixelSize: OmaTheme.fontSmall
                     color: OmaTheme.faint
@@ -1128,10 +1513,11 @@ ShellRoot {
               }
             }
 
-            // Scope tabs strip (left) + Inline Legend when wide
+            // Scope tabs strip (left) + Inline Legend when wide (Advanced Mode only)
             Item {
               width: parent.width
               height: 20
+              visible: !filterBar.isBasic
 
               Row {
                 id: scopeRow
@@ -1141,19 +1527,13 @@ ShellRoot {
                 height: 20
 
                 Repeater {
-                  model: app.currentMode === "apps"
-                    ? [
-                        { id: "all", label: "ALL APPS" },
-                        { id: "hyprland", label: "HYPRLAND" },
-                        { id: "xdg", label: "XDG" }
-                      ]
-                    : [
-                        { id: "all", label: "ALL" },
-                        { id: "hyprland", label: "HYPRLAND" },
-                        { id: "xdg", label: "XDG" },
-                        { id: "systemd-user", label: "USER" },
-                        { id: "systemd-system", label: "SYSTEM" }
-                      ]
+                  model: [
+                    { id: "all", label: "ALL" },
+                    { id: "hyprland", label: "HYPRLAND" },
+                    { id: "xdg", label: "XDG" },
+                    { id: "systemd-user", label: "USER" },
+                    { id: "systemd-system", label: "SYSTEM" }
+                  ]
 
                   delegate: Item {
                     readonly property bool isSelected: app.scopeFilter === modelData.id
@@ -1242,7 +1622,7 @@ ShellRoot {
 
             // Wrapped legend row (split-screen / narrow window mode — never overlaps)
             Row {
-              visible: filterBar.wrapLegend
+              visible: !filterBar.isBasic && filterBar.wrapLegend
               height: 16
               spacing: 14
 
@@ -1285,7 +1665,7 @@ ShellRoot {
           Text {
             anchors.centerIn: parent
             visible: !app.loading && app.visibleRows.length === 0
-            text: "No matching startup entries"
+            text: app.currentMode === "apps" ? "No startup applications found. Press '+ ADD' to add one." : "No matching startup entries"
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontBody
             color: OmaTheme.muted
@@ -1352,9 +1732,16 @@ ShellRoot {
             anchors.rightMargin: 18
             anchors.verticalCenter: parent.verticalCenter
             visible: parent.width >= 520
-            text: parent.width >= 760
-              ? "j/k move  ·  Space toggle  ·  m mode  ·  u undo  ·  Enter inspect  ·  b boot  ·  / search  ·  a add  ·  q quit"
-              : "j/k  ·  Space  ·  m  ·  u  ·  Enter  ·  b  ·  /  ·  a  ·  q"
+            text: {
+              if (app.currentMode === "apps") {
+                return parent.width >= 720
+                  ? "j/k move  ·  Space toggle  ·  m mode  ·  + add  ·  / search  ·  u undo  ·  Enter inspect  ·  q quit"
+                  : "Space toggle  ·  m mode  ·  + add  ·  / search  ·  q quit"
+              }
+              return parent.width >= 760
+                ? "j/k move  ·  Space toggle  ·  m mode  ·  u undo  ·  Enter inspect  ·  b boot  ·  / search  ·  a add  ·  q quit"
+                : "j/k  ·  Space  ·  m  ·  u  ·  Enter  ·  b  ·  /  ·  a  ·  q"
+            }
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontCaption
             color: OmaTheme.dim
@@ -1527,9 +1914,10 @@ ShellRoot {
             Text {
               id: uninstalledTxt
               anchors.centerIn: parent
-              text: "uninstalled"
+              text: "UNINSTALLED"
               font.family: OmaTheme.fontFamily
               font.pixelSize: OmaTheme.fontCaption
+              font.bold: true
               color: OmaTheme.yellow
             }
 
@@ -1537,7 +1925,7 @@ ShellRoot {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onEntered: app.statusMessage = "This package was uninstalled, but remains in your startup configuration."
+              onEntered: app.statusMessage = "Your package has been uninstalled, but the .config has not been updated with the uninstallation."
               onExited: app.statusMessage = ""
               onClicked: {
                 app.cursorItemId = itemRect.it.id
@@ -1731,7 +2119,7 @@ ShellRoot {
 
                 Text {
                   anchors.verticalCenter: parent.verticalCenter
-                  text: "This application was uninstalled, but remains in your startup configuration."
+                  text: "Your package has been uninstalled, but the .config has not been updated with the uninstallation."
                   font.family: OmaTheme.fontFamily
                   font.pixelSize: OmaTheme.fontSmall
                   color: OmaTheme.yellow
@@ -2749,267 +3137,7 @@ ShellRoot {
         }
       }
 
-      // ======================================================================
-      // MODAL 5: HWiNFO-Style Launch Mode Selection Dialog
-      // ======================================================================
-      Rectangle {
-        anchors.fill: parent
-        visible: app.modePromptOpen
-        color: OmaTheme.scrim
-        z: 50
 
-        Rectangle {
-          id: modeDialogCard
-          anchors.centerIn: parent
-          width: Math.min(parent.width - 40, 620)
-          height: 320
-          radius: OmaTheme.cornerRadius
-          color: OmaTheme.surface
-          border.width: 1
-          border.color: OmaTheme.accent
-
-          Column {
-            anchors.fill: parent
-            anchors.margins: 20
-            spacing: 16
-
-            // Header
-            Column {
-              width: parent.width
-              spacing: 4
-
-              Text {
-                text: "SELECT STARTUP VIEW"
-                font.family: OmaTheme.fontFamily
-                font.pixelSize: OmaTheme.fontSubtitle
-                font.bold: true
-                font.letterSpacing: 1.2
-                color: OmaTheme.foreground
-              }
-
-              Text {
-                text: "Choose what you want to manage. You can switch anytime using the header toggle or 'm'."
-                font.family: OmaTheme.fontFamily
-                font.pixelSize: OmaTheme.fontSmall
-                color: OmaTheme.muted
-              }
-            }
-
-            // Two Cards Side-by-Side
-            Row {
-              width: parent.width
-              height: 140
-              spacing: 12
-
-              // Card 1: APPLICATIONS
-              Rectangle {
-                id: appsCard
-                width: (parent.width - 12) / 2
-                height: parent.height
-                radius: OmaTheme.cornerRadius
-                color: app.selectedLaunchMode === "apps" ? OmaTheme.hoverFill : OmaTheme.background
-                border.width: app.selectedLaunchMode === "apps" ? 2 : 1
-                border.color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.hairline
-
-                MouseArea {
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: app.selectedLaunchMode = "apps"
-                  onDoubleClicked: {
-                    app.selectedLaunchMode = "apps"
-                    app.confirmLaunchMode()
-                  }
-                }
-
-                Column {
-                  anchors.fill: parent
-                  anchors.margins: 14
-                  spacing: 6
-
-                  Row {
-                    width: parent.width
-                    spacing: 8
-
-                    Rectangle {
-                      width: 20
-                      height: 20
-                      radius: 3
-                      color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.elevated
-                      Text {
-                        anchors.centerIn: parent
-                        text: "1"
-                        font.family: OmaTheme.fontFamily
-                        font.pixelSize: OmaTheme.fontCaption
-                        font.bold: true
-                        color: OmaTheme.foreground
-                      }
-                    }
-
-                    Text {
-                      anchors.verticalCenter: parent.verticalCenter
-                      text: "APPLICATIONS"
-                      font.family: OmaTheme.fontFamily
-                      font.pixelSize: OmaTheme.fontBody
-                      font.bold: true
-                      color: app.selectedLaunchMode === "apps" ? OmaTheme.accent : OmaTheme.foreground
-                    }
-                  }
-
-                  Text {
-                    text: "Desktop Apps & Autostart"
-                    font.family: OmaTheme.fontFamily
-                    font.pixelSize: OmaTheme.fontCaption
-                    color: OmaTheme.muted
-                  }
-
-                  Text {
-                    width: parent.width
-                    wrapMode: Text.WordWrap
-                    text: "Manage user programs, bars, and scripts that launch when you log in (Hyprland, XDG desktop autostarts, user hooks)."
-                    font.family: OmaTheme.fontFamily
-                    font.pixelSize: OmaTheme.fontSmall
-                    color: OmaTheme.dim
-                  }
-                }
-              }
-
-              // Card 2: SYSTEM & SERVICES
-              Rectangle {
-                id: systemCard
-                width: (parent.width - 12) / 2
-                height: parent.height
-                radius: OmaTheme.cornerRadius
-                color: app.selectedLaunchMode === "system" ? OmaTheme.hoverFill : OmaTheme.background
-                border.width: app.selectedLaunchMode === "system" ? 2 : 1
-                border.color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.hairline
-
-                MouseArea {
-                  anchors.fill: parent
-                  hoverEnabled: true
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: app.selectedLaunchMode = "system"
-                  onDoubleClicked: {
-                    app.selectedLaunchMode = "system"
-                    app.confirmLaunchMode()
-                  }
-                }
-
-                Column {
-                  anchors.fill: parent
-                  anchors.margins: 14
-                  spacing: 6
-
-                  Row {
-                    width: parent.width
-                    spacing: 8
-
-                    Rectangle {
-                      width: 20
-                      height: 20
-                      radius: 3
-                      color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.elevated
-                      Text {
-                        anchors.centerIn: parent
-                        text: "2"
-                        font.family: OmaTheme.fontFamily
-                        font.pixelSize: OmaTheme.fontCaption
-                        font.bold: true
-                        color: OmaTheme.foreground
-                      }
-                    }
-
-                    Text {
-                      anchors.verticalCenter: parent.verticalCenter
-                      text: "SYSTEM & SERVICES"
-                      font.family: OmaTheme.fontFamily
-                      font.pixelSize: OmaTheme.fontBody
-                      font.bold: true
-                      color: app.selectedLaunchMode === "system" ? OmaTheme.accent : OmaTheme.foreground
-                    }
-                  }
-
-                  Text {
-                    text: "Full Daemons & Diagnostics"
-                    font.family: OmaTheme.fontFamily
-                    font.pixelSize: OmaTheme.fontCaption
-                    color: OmaTheme.muted
-                  }
-
-                  Text {
-                    width: parent.width
-                    wrapMode: Text.WordWrap
-                    text: "Systemd background daemons, socket activations, timers, boot bottleneck analysis, and journal logs."
-                    font.family: OmaTheme.fontFamily
-                    font.pixelSize: OmaTheme.fontSmall
-                    color: OmaTheme.dim
-                  }
-                }
-              }
-            }
-
-            // Bottom Row: Remember Checkbox + Launch Button
-            Item {
-              width: parent.width
-              height: 32
-
-              Row {
-                anchors.left: parent.left
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 8
-
-                Rectangle {
-                  width: 16
-                  height: 16
-                  radius: 3
-                  color: app.rememberModeChoice ? OmaTheme.accent : OmaTheme.elevated
-                  border.width: 1
-                  border.color: app.rememberModeChoice ? OmaTheme.accent : OmaTheme.normalBorder
-                  anchors.verticalCenter: parent.verticalCenter
-
-                  Text {
-                    visible: app.rememberModeChoice
-                    anchors.centerIn: parent
-                    text: "✓"
-                    font.family: OmaTheme.fontFamily
-                    font.pixelSize: OmaTheme.fontCaption
-                    font.bold: true
-                    color: OmaTheme.background
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: app.rememberModeChoice = !app.rememberModeChoice
-                  }
-                }
-
-                Text {
-                  anchors.verticalCenter: parent.verticalCenter
-                  text: "Remember my choice (don't prompt on launch)"
-                  font.family: OmaTheme.fontFamily
-                  font.pixelSize: OmaTheme.fontSmall
-                  color: OmaTheme.muted
-
-                  MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: app.rememberModeChoice = !app.rememberModeChoice
-                  }
-                }
-              }
-
-              OmaButton {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                text: "LAUNCH · ENTER"
-                accentStyle: true
-                onClicked: app.confirmLaunchMode()
-              }
-            }
-          }
-        }
-      }
     }
   }
 }

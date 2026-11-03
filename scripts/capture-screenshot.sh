@@ -7,78 +7,41 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 SCREENSHOT_DIR="$REPO_DIR/assets/screenshots"
 HIST_DIR="$SCREENSHOT_DIR/history"
 SETTINGS_DIR="$HOME/.config/omastart"
+PICTURES_DIR="$HOME/Pictures"
 
-mkdir -p "$SCREENSHOT_DIR" "$HIST_DIR" "$SETTINGS_DIR"
+mkdir -p "$SCREENSHOT_DIR" "$HIST_DIR" "$SETTINGS_DIR" "$PICTURES_DIR"
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-
-# Save settings to bypass prompt for headless capture
-echo '{"rememberMode": true, "mode": "apps"}' > "$SETTINGS_DIR/settings.json"
-
 export OMARCHY_STARTUP_BIN="$REPO_DIR/bin/omarchy-startup"
 
-# 1. Launch Applications View
-quickshell -p "$REPO_DIR/qml/Main.qml" &
-QS_PID=$!
-
-sleep 2.5
-
-# Find geometry
-GEOM="$(hyprctl -j clients | python3 -c '
-import json, sys
-clients = json.load(sys.stdin)
-target = next((c for c in clients if c.get("title") == "Startup"), None)
-if target:
-    x, y = target["at"]
-    w, h = target["size"]
-    print(f"{x},{y} {w}x{h}")
-')"
-
-stop_qs() {
-    local pid="$1"
-    kill "$pid" 2>/dev/null || true
-    for _ in {1..10}; do
-        if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
-        sleep 0.1
-    done
-    kill -9 "$pid" 2>/dev/null || true
-}
-
-if [ -n "$GEOM" ]; then
-    grim -g "$GEOM" "$SCREENSHOT_DIR/preview.png"
-    cp "$SCREENSHOT_DIR/preview.png" "$HIST_DIR/omastart_${TIMESTAMP}_apps.png"
-    echo "Saved preview.png and history/omastart_${TIMESTAMP}_apps.png"
+# 1. Capture Floating Mode Prompt Dialog
+echo '{"rememberMode": false, "mode": "apps"}' > "$SETTINGS_DIR/settings.json"
+OMASTART_SCREENSHOT_DEST="$SCREENSHOT_DIR/preview_prompt.png" quickshell -p "$REPO_DIR/qml/Main.qml"
+if [ -f "$SCREENSHOT_DIR/preview_prompt.png" ]; then
+    cp "$SCREENSHOT_DIR/preview_prompt.png" "$HIST_DIR/omastart_${TIMESTAMP}_prompt.png"
+    cp "$SCREENSHOT_DIR/preview_prompt.png" "$PICTURES_DIR/screenshot-${TIMESTAMP}_prompt.png"
+    echo "Saved preview_prompt.png"
 fi
 
-stop_qs "$QS_PID"
+# 2. Capture Basic Mode (Applications View)
+echo '{"rememberMode": true, "mode": "apps"}' > "$SETTINGS_DIR/settings.json"
+OMASTART_SCREENSHOT_DEST="$SCREENSHOT_DIR/preview.png" quickshell -p "$REPO_DIR/qml/Main.qml"
+if [ -f "$SCREENSHOT_DIR/preview.png" ]; then
+    cp "$SCREENSHOT_DIR/preview.png" "$HIST_DIR/omastart_${TIMESTAMP}_basic.png"
+    cp "$SCREENSHOT_DIR/preview.png" "$PICTURES_DIR/screenshot-${TIMESTAMP}_basic.png"
+    echo "Saved preview.png (Basic Mode)"
+fi
 
-# 2. Launch System View
+# 3. Capture Advanced Mode (System View)
 echo '{"rememberMode": true, "mode": "system"}' > "$SETTINGS_DIR/settings.json"
-
-quickshell -p "$REPO_DIR/qml/Main.qml" &
-QS_PID=$!
-
-sleep 2.5
-
-GEOM="$(hyprctl -j clients | python3 -c '
-import json, sys
-clients = json.load(sys.stdin)
-target = next((c for c in clients if c.get("title") == "Startup"), None)
-if target:
-    x, y = target["at"]
-    w, h = target["size"]
-    print(f"{x},{y} {w}x{h}")
-')"
-
-if [ -n "$GEOM" ]; then
-    grim -g "$GEOM" "$SCREENSHOT_DIR/preview_system.png"
-    cp "$SCREENSHOT_DIR/preview_system.png" "$HIST_DIR/omastart_${TIMESTAMP}_system.png"
-    echo "Saved preview_system.png and history/omastart_${TIMESTAMP}_system.png"
+OMASTART_SCREENSHOT_DEST="$SCREENSHOT_DIR/preview_system.png" quickshell -p "$REPO_DIR/qml/Main.qml"
+if [ -f "$SCREENSHOT_DIR/preview_system.png" ]; then
+    cp "$SCREENSHOT_DIR/preview_system.png" "$HIST_DIR/omastart_${TIMESTAMP}_advanced.png"
+    cp "$SCREENSHOT_DIR/preview_system.png" "$PICTURES_DIR/screenshot-${TIMESTAMP}_advanced.png"
+    echo "Saved preview_system.png (Advanced Mode)"
 fi
-
-stop_qs "$QS_PID"
 
 # Restore prompt on launch
 echo '{"rememberMode": false, "mode": "apps"}' > "$SETTINGS_DIR/settings.json"
 
-echo "Screenshots updated successfully!"
+echo "All screenshots updated successfully!"

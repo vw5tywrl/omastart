@@ -1243,6 +1243,7 @@ def collect_all_startup_data() -> BootSummary:
         {
             "id": it.id,
             "name": it.name,
+            "description": it.description or it.command,
             "sourceLabel": it.source.label,
             "pkgName": it.package.name if it.package else "",
             "bootTimeMs": it.boot_time_ms,

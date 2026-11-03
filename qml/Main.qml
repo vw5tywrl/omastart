@@ -2302,7 +2302,7 @@ ShellRoot {
                     anchors.rightMargin: 10
                     anchors.verticalCenter: parent.verticalCenter
                     elide: Text.ElideRight
-                    text: modelData.description || modelData.command
+                    text: modelData.description || modelData.command || ""
                     font.family: OmaTheme.fontFamily
                     font.pixelSize: OmaTheme.fontSmall
                     color: OmaTheme.faint

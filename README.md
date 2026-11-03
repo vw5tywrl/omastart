@@ -4,6 +4,8 @@ Startup manager for Omarchy and Arch Linux (Hyprland).
 
 Aggregates systemd units, Hyprland autostart commands, and Omarchy post-boot hooks into a single interface.
 
+![omastart preview](assets/screenshots/preview.png)
+
 ## Requirements
 
 - Arch Linux or Omarchy

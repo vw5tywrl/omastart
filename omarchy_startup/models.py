@@ -91,6 +91,9 @@ class StartupItem:
     read_only_reason: str = ""
     can_delete: bool = False
     is_critical: bool = False
+    is_masked: bool = False
+    is_vendor_default: bool = False
+    triggered_by: str = ""
     line_number: Optional[int] = None
     raw_line: str = ""
     extra_meta: dict[str, str] = field(default_factory=dict)
@@ -142,6 +145,9 @@ class StartupItem:
             "readOnlyReason": self.read_only_reason,
             "canDelete": self.can_delete,
             "isCritical": self.is_critical,
+            "isMasked": self.is_masked,
+            "isVendorDefault": self.is_vendor_default,
+            "triggeredBy": self.triggered_by,
             "lineNumber": self.line_number or 0,
             "extraMeta": self.extra_meta,
         }
@@ -153,4 +159,6 @@ class BootSummary:
     userspace_time: str = "—"
     graphical_time: str = "—"
     raw_breakdown: str = ""
+    stages: list[dict[str, object]] = field(default_factory=list)
+    slowest_units: list[dict[str, object]] = field(default_factory=list)
     items: list[StartupItem] = field(default_factory=list)

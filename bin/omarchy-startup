@@ -27,6 +27,8 @@ def _handle_backend(subcmd: str, payload_raw: str) -> int:
             "userspaceTime": s.userspace_time,
             "graphicalTime": s.graphical_time,
             "rawBreakdown": s.raw_breakdown,
+            "stages": s.stages,
+            "slowestUnits": s.slowest_units,
             "items": [i.to_ui_dict() for i in s.items],
         }
         print(json.dumps(out, ensure_ascii=False))
@@ -93,18 +95,17 @@ def _handle_backend(subcmd: str, payload_raw: str) -> int:
         return 0
 
     if subcmd == "open-dir":
-        p = Path(data.get("path", ""))
-        folder = p.parent if p.is_file() else p
-        if folder.exists():
-            subprocess.Popen(
-                ["uwsm-app", "--", "xdg-open", str(folder)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            print(json.dumps({"ok": False, "message": f"Opened {folder}"}))
-        else:
-            print(json.dumps({"ok": False, "message": "Directory not found"}))
+        from omarchy_startup.actions import open_dir_raw
+
+        ok, msg = open_dir_raw(data.get("path", ""))
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+        return 0
+
+    if subcmd == "open-editor":
+        from omarchy_startup.actions import open_in_editor_raw
+
+        ok, msg = open_in_editor_raw(data.get("item", {}))
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
         return 0
 
     print(json.dumps({"ok": False, "message": f"Unknown command: {subcmd}"}))

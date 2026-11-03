@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import configparser
+import glob as glob_mod
 import json
 import os
 from pathlib import Path
@@ -74,13 +75,43 @@ def _run_cmd(args: list[str], timeout: float = 5.0) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
+def _parse_systemd_duration_ms(text: str) -> float:
+    """Parse systemd duration strings like '1min 2.345s', '821ms', '21.792s' into ms."""
+    s = text.strip()
+    if not s:
+        return 0.0
+    total_ms = 0.0
+    for m in re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*(min|ms|us|µs|s|h)", s):
+        val = float(m.group(1))
+        unit = m.group(2)
+        if unit == "h":
+            total_ms += val * 3_600_000.0
+        elif unit == "min":
+            total_ms += val * 60_000.0
+        elif unit == "s":
+            total_ms += val * 1000.0
+        elif unit == "ms":
+            total_ms += val
+        elif unit in ("us", "µs"):
+            total_ms += val / 1000.0
+    return total_ms
+
+
 def _compute_monotonic_ms(info: dict[str, str]) -> Optional[float]:
     try:
         t_start = int(info.get("InactiveExitTimestampMonotonic", "0") or "0")
         t_end = int(info.get("ActiveEnterTimestampMonotonic", "0") or "0")
         if t_start > 0 and t_end >= t_start:
             ms = (t_end - t_start) / 1000.0
-            return ms if ms >= 0.5 else None
+            if ms >= 0.5:
+                return ms
+        # Oneshot units without RemainAfterExit never enter 'active'; measure ExecMain
+        ex_start = int(info.get("ExecMainStartTimestampMonotonic", "0") or "0")
+        ex_end = int(info.get("ExecMainExitTimestampMonotonic", "0") or "0")
+        if ex_start > 0 and ex_end >= ex_start:
+            ms = (ex_end - ex_start) / 1000.0
+            if ms >= 0.5:
+                return ms
     except ValueError:
         pass
     return None
@@ -93,6 +124,7 @@ def _collect_boot_summary() -> BootSummary:
         return summary
     lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
     summary.raw_breakdown = "\n".join(lines)
+    stages: list[dict[str, object]] = []
     if lines:
         first = lines[0]
         m_total = re.search(r"=\s*([0-9a-zA-Z.\s]+)$", first)
@@ -101,10 +133,32 @@ def _collect_boot_summary() -> BootSummary:
         m_user = re.search(r"([0-9a-zA-Z.\s]+?)\s*\(userspace\)", first)
         if m_user:
             summary.userspace_time = m_user.group(1).strip()
+
+        # Extract each 'X.XXXs (stage)' segment
+        body = re.sub(r"^Startup finished in\s+", "", first)
+        body = re.sub(r"\s*=\s*[^=]+$", "", body)
+        for part in body.split("+"):
+            pm = re.match(r"^\s*([0-9a-zA-Z.\s]+?)\s*\(([^)]+)\)\s*$", part)
+            if pm:
+                dur_txt = pm.group(1).strip()
+                stg_name = pm.group(2).strip()
+                stages.append(
+                    {
+                        "name": stg_name,
+                        "label": stg_name.capitalize(),
+                        "time": dur_txt,
+                        "text": dur_txt,
+                        "ms": round(_parse_systemd_duration_ms(dur_txt), 1),
+                    }
+                )
+        tot_ms = sum(float(s["ms"]) for s in stages) or 1.0
+        for s in stages:
+            s["percent"] = round((float(s["ms"]) / tot_ms) * 100, 1)
     if len(lines) > 1:
         m_graph = re.search(r"after\s+([0-9a-zA-Z.\s]+?)\s+in userspace", lines[1])
         if m_graph:
             summary.graphical_time = m_graph.group(1).strip()
+    summary.stages = stages
     return summary
 
 
@@ -130,8 +184,13 @@ def _collect_running_processes() -> list[tuple[int, str, str]]:
     return procs
 
 
+def _strip_hypr_exec_rules(command: str) -> str:
+    """Strip Hyprland dispatch rules prefix such as '[workspace 2 silent] firefox'."""
+    return re.sub(r"^\s*\[[^\]]*\]\s*", "", command.strip())
+
+
 def _extract_first_executable(command: str) -> str:
-    cmd = command.strip()
+    cmd = _strip_hypr_exec_rules(command)
     if not cmd:
         return ""
     cmd = re.sub(r"^[-@:+!]+\s*", "", cmd)
@@ -145,7 +204,19 @@ def _extract_first_executable(command: str) -> str:
         tokens = shlex.split(cmd)
     except ValueError:
         tokens = cmd.split()
-    skip_wrappers = {"uwsm-app", "--", "env", "nohup", "setsid", "sh", "bash", "-c"}
+    skip_wrappers = {
+        "uwsm-app",
+        "uwsm",
+        "app",
+        "--",
+        "env",
+        "nohup",
+        "setsid",
+        "sh",
+        "bash",
+        "-c",
+        "-lc",
+    }
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
@@ -155,8 +226,8 @@ def _extract_first_executable(command: str) -> str:
         if tok in skip_wrappers:
             idx += 1
             continue
-        return tok
-    return tokens[0] if tokens else ""
+        return os.path.expanduser(tok)
+    return os.path.expanduser(tokens[0]) if tokens else ""
 
 
 def _resolve_binary_path(command: str) -> str:
@@ -204,9 +275,72 @@ def _match_process(
     return None
 
 
+def detect_hyprland_user_target() -> tuple[Path, str]:
+    """Return (target_file, format) where format is 'lua' or 'conf'."""
+    hypr_dir = HOME / ".config" / "hypr"
+    if (hypr_dir / "hyprland.lua").is_file() or (hypr_dir / "autostart.lua").is_file():
+        return hypr_dir / "autostart.lua", "lua"
+    if (hypr_dir / "autostart.conf").is_file():
+        return hypr_dir / "autostart.conf", "conf"
+    if (hypr_dir / "hyprland.conf").is_file():
+        return hypr_dir / "hyprland.conf", "conf"
+    if (OMARCHY_PATH / "default" / "hypr" / "autostart.lua").is_file():
+        return hypr_dir / "autostart.lua", "lua"
+    return hypr_dir / "hyprland.conf", "conf"
+
+
+def _discover_hypr_conf_files() -> list[Path]:
+    """Find user Hyprland .conf files (hyprland.conf, autostart.conf, and sourced files)."""
+    hypr_dir = HOME / ".config" / "hypr"
+    if not hypr_dir.is_dir():
+        return []
+
+    seen: set[Path] = set()
+    ordered: list[Path] = []
+
+    def _add(p: Path) -> None:
+        try:
+            rp = p.resolve()
+        except OSError:
+            rp = p
+        if rp not in seen and p.is_file():
+            seen.add(rp)
+            ordered.append(p)
+
+    main_conf = hypr_dir / "hyprland.conf"
+    auto_conf = hypr_dir / "autostart.conf"
+    _add(auto_conf)
+    _add(main_conf)
+
+    # Follow top-level `source = ...` directives inside hyprland.conf
+    if main_conf.is_file():
+        try:
+            for raw in main_conf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = raw.strip()
+                if not s or s.startswith("#"):
+                    continue
+                m = re.match(r"^source\s*=\s*(.+)$", s)
+                if not m:
+                    continue
+                src_expr = m.group(1).split("#", 1)[0].strip()
+                src_expr = src_expr.replace("$HOME", str(HOME))
+                src_expr = os.path.expanduser(src_expr)
+                if not src_expr.startswith("/"):
+                    src_expr = str(hypr_dir / src_expr)
+                for matched in sorted(glob_mod.glob(src_expr)):
+                    mp = Path(matched)
+                    if mp.suffix == ".conf":
+                        _add(mp)
+        except OSError:
+            pass
+
+    return ordered
+
+
 def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
     items: list[StartupItem] = []
 
+    # 1. Omarchy default read-only Lua autostarts (if running on Omarchy)
     default_lua = OMARCHY_PATH / "default" / "hypr" / "autostart.lua"
     if default_lua.is_file():
         try:
@@ -245,7 +379,7 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
                 "omarchy-hook",
             }
             if pid is not None:
-                r_state, r_label = "running", f"active · {pid}"
+                r_state, r_label = "running", "active"
             elif exe_base in oneshot_cmds:
                 r_state, r_label = "oneshot_done", "done"
             else:
@@ -268,9 +402,11 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
                     read_only_reason="Managed by Omarchy (/usr/share/omarchy/ is read-only across updates).",
                     line_number=idx,
                     raw_line=line,
+                    extra_meta={"hypr_format": "lua"},
                 )
             )
 
+    # 2. User ~/.config/hypr/autostart.lua (Omarchy Lua style)
     user_lua = HOME / ".config" / "hypr" / "autostart.lua"
     if user_lua.is_file():
         try:
@@ -301,7 +437,7 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
             if not enabled:
                 r_state, r_label = "inactive", "disabled"
             elif pid is not None:
-                r_state, r_label = "running", f"active · {pid}"
+                r_state, r_label = "running", "active"
             else:
                 r_state, r_label = "inactive", "stopped"
 
@@ -311,7 +447,7 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
             )
             items.append(
                 StartupItem(
-                    id=f"hypr-user:{idx}:{cmd}",
+                    id=f"hypr-user:{user_lua}:{idx}:{cmd}",
                     name=exe_base or cmd,
                     description=desc,
                     command=cmd,
@@ -326,8 +462,107 @@ def _collect_hyprland_items(procs: list[tuple[int, str, str]]) -> list[StartupIt
                     can_delete=True,
                     line_number=idx,
                     raw_line=line,
+                    extra_meta={"hypr_format": "lua"},
                 )
             )
+
+    # 3. Standard Hyprland .conf files (exec-once = ...) for vanilla Arch + Hyprland users
+    conf_files = _discover_hypr_conf_files()
+    if conf_files:
+        hypr_vars: dict[str, str] = {}
+        for cf in conf_files:
+            try:
+                for raw in cf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    vm = re.match(r"^\s*\$([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$", raw)
+                    if vm:
+                        hypr_vars["$" + vm.group(1)] = vm.group(2).strip()
+            except OSError:
+                pass
+
+        exec_pattern = re.compile(
+            r"^(?P<comment>#\s*(?:\[disabled\]\s*)?)?"
+            r"exec-once\s*=\s*(?P<cmd>.+?)\s*$"
+        )
+
+        for cf in conf_files:
+            is_dedicated_autostart = "autostart" in cf.name.lower()
+            try:
+                lines = cf.read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                continue
+
+            for idx, line in enumerate(lines, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                m = exec_pattern.match(stripped)
+                if not m:
+                    continue
+
+                comment_prefix = m.group("comment") or ""
+                is_commented = bool(comment_prefix)
+                raw_cmd = m.group("cmd").strip()
+                if not raw_cmd:
+                    continue
+
+                # Avoid picking up stock hyprland.conf commented examples like `# exec-once = $terminal`
+                if is_commented and "[disabled]" not in comment_prefix:
+                    if not is_dedicated_autostart or "$" in raw_cmd:
+                        continue
+
+                # Expand Hyprland $vars for binary/process resolution
+                expanded_cmd = raw_cmd
+                for k, v in hypr_vars.items():
+                    if k in expanded_cmd:
+                        expanded_cmd = expanded_cmd.replace(k, v)
+
+                if expanded_cmd.startswith(
+                    "systemctl --user import-environment"
+                ) or expanded_cmd.startswith("dbus-update-activation-environment"):
+                    continue
+
+                is_sys_read_only = not str(cf).startswith(str(HOME) + "/")
+                enabled = not is_commented
+                clean_exec_cmd = _strip_hypr_exec_rules(expanded_cmd)
+                bin_path = _resolve_binary_path(clean_exec_cmd)
+                exe_base = os.path.basename(_extract_first_executable(clean_exec_cmd))
+                pid = _match_process(exe_base, clean_exec_cmd, procs) if enabled else None
+
+                if not enabled:
+                    r_state, r_label = "inactive", "disabled"
+                elif pid is not None:
+                    r_state, r_label = "running", "active"
+                else:
+                    r_state, r_label = "inactive", "stopped"
+
+                desc = (
+                    _read_omarchy_script_summary(bin_path)
+                    or f"Hyprland exec-once ({cf.name})"
+                )
+                items.append(
+                    StartupItem(
+                        id=f"hypr-conf:{cf}:{idx}:{raw_cmd}",
+                        name=exe_base or raw_cmd,
+                        description=desc,
+                        command=clean_exec_cmd,
+                        source=(
+                            SourceKind.HYPRLAND_DEFAULT
+                            if is_sys_read_only
+                            else SourceKind.HYPRLAND_USER
+                        ),
+                        enabled=enabled,
+                        running_state=r_state,
+                        running_label=r_label,
+                        config_path=str(cf),
+                        binary_path=bin_path,
+                        pid=pid,
+                        read_only=is_sys_read_only,
+                        can_delete=not is_sys_read_only,
+                        line_number=idx,
+                        raw_line=line,
+                        extra_meta={"hypr_format": "conf"},
+                    )
+                )
 
     return items
 
@@ -388,6 +623,7 @@ def _collect_hook_items() -> list[StartupItem]:
                 binary_path="",
                 read_only=False,
                 can_delete=not is_stock_sample,
+                is_vendor_default=is_stock_sample,
                 extra_meta={"is_stock_sample": "1" if is_stock_sample else "0"},
             )
         )
@@ -459,7 +695,8 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
 
         name = merged.get("name") or desktop_id.removesuffix(".desktop")
         comment = merged.get("comment") or "XDG autostart entry"
-        exec_cmd = merged.get("exec", "")
+        exec_raw = merged.get("exec", "")
+        exec_cmd = re.sub(r"\s+%[fFuUdDnNickvm]\b", "", exec_raw).strip()
 
         bin_path = _resolve_binary_path(exec_cmd)
         exe_base = os.path.basename(_extract_first_executable(exec_cmd))
@@ -468,7 +705,7 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
         if not enabled:
             r_state, r_label = "inactive", "disabled"
         elif pid is not None:
-            r_state, r_label = "running", f"active · {pid}"
+            r_state, r_label = "running", "active"
         else:
             r_state, r_label = "oneshot_done", "done"
 
@@ -488,6 +725,7 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
             pid=pid,
             read_only=False,
             can_delete=(has_usr and not has_sys),
+            is_vendor_default=(not enabled and not has_usr),
             extra_meta={
                 "desktop_id": desktop_id,
                 "has_sys": "1" if has_sys else "0",
@@ -506,7 +744,7 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
                 "systemctl",
                 "--user",
                 "show",
-                "--property=Id,InactiveExitTimestampMonotonic,ActiveEnterTimestampMonotonic",
+                "--property=Id,InactiveExitTimestampMonotonic,ActiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic",
                 "--no-pager",
             ]
             + list(gen_units_to_query.keys()),
@@ -539,9 +777,22 @@ def _find_unit_file_on_disk(unit_name: str, user: bool) -> str:
     )
     for d in search_dirs:
         p = d / unit_name
-        if p.is_file():
+        if p.is_file() or p.is_symlink():
             return str(p)
     return ""
+
+
+def _has_user_or_etc_override(unit_name: str, user: bool) -> bool:
+    """Return True if unit has any file/symlink in ~/.config/systemd or /etc/systemd."""
+    dirs = (
+        [HOME / ".config" / "systemd" / "user", Path("/etc/systemd/user")]
+        if user
+        else [Path("/etc/systemd/system")]
+    )
+    for d in dirs:
+        if (d / unit_name).exists() or (d / unit_name).is_symlink():
+            return True
+    return False
 
 
 def _read_unit_file_fast(unit_path: str, unit_name: str) -> tuple[str, str, str]:
@@ -567,14 +818,14 @@ def _read_unit_file_fast(unit_path: str, unit_name: str) -> tuple[str, str, str]
 
 def _collect_systemd_items(user: bool) -> list[StartupItem]:
     base_cmd = ["systemctl", "--user"] if user else ["systemctl"]
-    types = "service,socket,timer" if user else "service,timer"
+    types = "service,socket,timer"
 
     rc, out, _ = _run_cmd(
         base_cmd
         + [
             "list-unit-files",
             f"--type={types}",
-            "--state=enabled,enabled-runtime,disabled",
+            "--state=enabled,enabled-runtime,disabled,masked,masked-runtime",
             "--output=json",
             "--no-pager",
         ],
@@ -621,7 +872,9 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
     ]
     props = (
         "Id,Description,FragmentPath,UnitFileState,ActiveState,SubState,"
-        "MainPID,ExecStart,Type,Result,InactiveExitTimestampMonotonic,ActiveEnterTimestampMonotonic"
+        "MainPID,ExecStart,Type,Result,TriggeredBy,"
+        "InactiveExitTimestampMonotonic,ActiveEnterTimestampMonotonic,"
+        "ExecMainStartTimestampMonotonic,ExecMainExitTimestampMonotonic"
     )
     details_by_id: dict[str, dict[str, str]] = {}
     if units_to_inspect:
@@ -645,11 +898,17 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
 
     for unit_name in sorted(unit_states.keys()):
         u_state = unit_states[unit_name]
+        is_masked = u_state in ("masked", "masked-runtime")
         enabled = u_state in ("enabled", "enabled-runtime")
         info = details_by_id.get(unit_name)
 
+        triggered_by = ""
         if info:
-            desc = info.get("Description") or unit_name
+            desc = (
+                info.get("Description")
+                if not is_masked
+                else ""
+            ) or unit_name
             frag_path = info.get("FragmentPath", "") or _find_unit_file_on_disk(
                 unit_name, user
             )
@@ -657,6 +916,7 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
             sub_state = info.get("SubState", "")
             service_type = info.get("Type", "")
             result = info.get("Result", "")
+            triggered_by = info.get("TriggeredBy", "").strip()
             main_pid_str = info.get("MainPID", "0")
             pid = (
                 int(main_pid_str)
@@ -674,10 +934,13 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
             bin_path = (
                 m_path.group(1).strip() if m_path else _resolve_binary_path(exec_cmd)
             )
-            boot_ms = _compute_monotonic_ms(info) if enabled else None
+            boot_ms = _compute_monotonic_ms(info) if (enabled or active_state == "active") else None
         else:
-            frag_path = _find_unit_file_on_disk(unit_name, user)
-            desc, exec_cmd, bin_path = _read_unit_file_fast(frag_path, unit_name)
+            # For masked units, FragmentPath may be /dev/null; check underlying vendor unit for description
+            vendor_dir = Path("/usr/lib/systemd/user" if user else "/usr/lib/systemd/system")
+            vendor_unit = str(vendor_dir / unit_name) if (vendor_dir / unit_name).is_file() else ""
+            frag_path = _find_unit_file_on_disk(unit_name, user) or vendor_unit
+            desc, exec_cmd, bin_path = _read_unit_file_fast(vendor_unit or frag_path, unit_name)
             active_state = "inactive"
             sub_state = "dead"
             service_type = ""
@@ -685,11 +948,25 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
             pid = None
             boot_ms = None
 
-        if active_state == "failed" or (
+        # Detect companion socket/timer trigger even when service isn't currently loaded
+        if not triggered_by and unit_name.endswith(".service"):
+            stem = unit_name[:-8]
+            companions = [
+                f"{stem}.{ext}"
+                for ext in ("socket", "timer")
+                if unit_states.get(f"{stem}.{ext}") in ("enabled", "enabled-runtime")
+            ]
+            if companions:
+                triggered_by = " ".join(companions)
+
+        if is_masked:
+            r_state = "inactive"
+            r_label = "masked"
+        elif active_state == "failed" or (
             result and result not in ("success", "done", "")
         ):
             r_state = "failed"
-            r_label = f"failed · {sub_state or result}"
+            r_label = "failed"
         elif active_state == "active" and sub_state in (
             "running",
             "listening",
@@ -700,16 +977,19 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
                 r_label = "listening"
             elif sub_state == "waiting":
                 r_label = "timer"
-            elif pid:
-                r_label = f"active · {pid}"
             else:
                 r_label = "active"
         elif active_state == "active" and sub_state == "exited":
             r_state = "oneshot_done"
             r_label = "exited"
         elif not enabled:
-            r_state = "inactive"
-            r_label = "disabled"
+            # Socket-activated services can be disabled as a unit file yet actively running right now!
+            if active_state == "active":
+                r_state = "running"
+                r_label = "active (socket)"
+            else:
+                r_state = "inactive"
+                r_label = "disabled"
         elif service_type == "oneshot" and result == "success":
             r_state = "oneshot_done"
             r_label = "done"
@@ -718,6 +998,13 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
             r_label = "inactive"
 
         pretty_name = unit_name.removesuffix(".service")
+        is_vendor_default = (
+            not enabled
+            and not is_masked
+            and r_state != "running"
+            and r_state != "failed"
+            and not _has_user_or_etc_override(unit_name, user)
+        )
 
         items.append(
             StartupItem(
@@ -736,10 +1023,14 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
                 pid=pid,
                 read_only=False,
                 is_critical=(unit_name in CRITICAL_UNITS),
+                is_masked=is_masked,
+                is_vendor_default=is_vendor_default,
+                triggered_by=triggered_by,
                 extra_meta={
                     "unit_state": u_state,
                     "active_state": active_state,
                     "sub_state": sub_state,
+                    "result": result,
                 },
             )
         )
@@ -806,18 +1097,25 @@ def _enrich_packages(items: list[StartupItem]) -> None:
             item.extra_meta.get("sys_path", ""),
             item.config_path,
         ]
+        # For masked units where config_path points to /dev/null, also check /usr/lib/systemd/...
+        if item.unit_name and item.source in (SourceKind.SYSTEMD_USER, SourceKind.SYSTEMD_SYSTEM):
+            sub = "user" if item.source == SourceKind.SYSTEMD_USER else "system"
+            raw_probes.append(f"/usr/lib/systemd/{sub}/{item.unit_name}")
+
         for p in raw_probes:
             if p and p.startswith("/") and os.path.exists(p):
-                if not p.startswith(str(HOME) + "/"):
-                    if p not in candidates:
-                        candidates.append(p)
-                    real_p = os.path.realpath(p)
-                    if (
-                        real_p != p
-                        and not real_p.startswith(str(HOME) + "/")
-                        and real_p not in candidates
-                    ):
-                        candidates.append(real_p)
+                if p == "/dev/null" or p.startswith(str(HOME) + "/"):
+                    continue
+                if p not in candidates:
+                    candidates.append(p)
+                real_p = os.path.realpath(p)
+                if (
+                    real_p != p
+                    and real_p != "/dev/null"
+                    and not real_p.startswith(str(HOME) + "/")
+                    and real_p not in candidates
+                ):
+                    candidates.append(real_p)
         for c in candidates:
             target_rel_paths.add(c.lstrip("/"))
         item_probes.append((item, candidates))
@@ -879,6 +1177,21 @@ def collect_all_startup_data() -> BootSummary:
 
     _enrich_packages(items)
     summary.items = items
+
+    # Compute top slowest units on this boot for the Boot Breakdown modal
+    timed = [it for it in items if it.boot_time_ms is not None and it.boot_time_ms >= 10.0]
+    timed.sort(key=lambda x: x.boot_time_ms or 0.0, reverse=True)
+    summary.slowest_units = [
+        {
+            "id": it.id,
+            "name": it.name,
+            "sourceLabel": it.source.label,
+            "pkgName": it.package.name if it.package else "",
+            "bootTimeMs": it.boot_time_ms,
+            "bootTimeText": it.boot_time_formatted,
+        }
+        for it in timed[:8]
+    ]
     return summary
 
 
@@ -928,11 +1241,13 @@ def list_installed_desktop_apps() -> list[dict[str, str]]:
             if not clean_cmd or name.lower() in seen_names:
                 continue
             seen_names.add(name.lower())
+            exe_base = os.path.basename(_extract_first_executable(clean_cmd))
             raw_entries.append((p, {
                 "id": p.name,
                 "name": name,
                 "description": entry.get("comment", "").strip(),
                 "command": clean_cmd,
+                "exeBase": exe_base,
             }))
             if not str(p).startswith(str(HOME) + "/"):
                 rel_lookup_paths.add(str(p).lstrip("/"))

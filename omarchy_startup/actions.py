@@ -4,12 +4,32 @@ import configparser
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
+import signal
 import subprocess
 
-from .models import SourceKind, StartupItem
+from .collector import _extract_first_executable, detect_hyprland_user_target
+from .models import SourceKind
 
 HOME = Path.home()
+
+PROTECTED_PROCESS_NAMES = {
+    "Hyprland",
+    "hyprland",
+    "quickshell",
+    "systemd",
+    "dbus-daemon",
+    "dbus-broker",
+    "pipewire",
+    "wireplumber",
+    "sddm",
+    "Xwayland",
+    "bash",
+    "zsh",
+    "fish",
+    "sh",
+}
 
 
 def _run_cmd(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
@@ -30,13 +50,58 @@ def _run_cmd(args: list[str], timeout: float = 15.0) -> tuple[int, str, str]:
         return 1, "", str(exc)
 
 
-def _validate_hyprland_or_rollback(user_lua: Path, backup_path: Path) -> tuple[bool, str]:
+def _spawn_detached(args: list[str]) -> bool:
+    """Spawn a detached GUI/session process, using uwsm-app only when available."""
+    cmd = (["uwsm-app", "--"] + args) if shutil.which("uwsm-app") else list(args)
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _stop_user_process_safely(pid: int, command: str) -> bool:
+    """Safely send SIGTERM to a user-owned process matching command's executable."""
+    if pid <= 1 or pid == os.getpid():
+        return False
+    exe_base = os.path.basename(_extract_first_executable(command))
+    if not exe_base or exe_base in PROTECTED_PROCESS_NAMES:
+        return False
+    proc_dir = Path(f"/proc/{pid}")
+    try:
+        if not proc_dir.is_dir():
+            return False
+        if proc_dir.stat().st_uid != os.getuid():
+            return False
+        comm = (proc_dir / "comm").read_text(encoding="utf-8", errors="ignore").strip()
+        cmdline = (
+            (proc_dir / "cmdline")
+            .read_bytes()
+            .replace(b"\x00", b" ")
+            .decode("utf-8", errors="ignore")
+        )
+        if comm != exe_base and exe_base not in cmdline:
+            return False
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def _validate_hyprland_or_rollback(target_path: Path, backup_path: Path) -> tuple[bool, str]:
+    if not shutil.which("hyprctl"):
+        return True, ""
     _run_cmd(["hyprctl", "reload"], timeout=4.0)
     rc, out, _ = _run_cmd(["hyprctl", "configerrors"], timeout=4.0)
     err_lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
     if rc == 0 and err_lines:
         if backup_path.is_file():
-            shutil.copy2(backup_path, user_lua)
+            shutil.copy2(backup_path, target_path)
             _run_cmd(["hyprctl", "reload"], timeout=4.0)
         return False, "Hyprland config error (restored backup): " + "; ".join(err_lines)
     return True, ""
@@ -51,37 +116,51 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
     source = SourceKind(payload["source"])
     config_path = payload.get("configPath", "")
     name = payload.get("name", "")
+    command = payload.get("command", "")
     unit_name = payload.get("unitName", "")
+    pid = int(payload.get("pid") or 0)
     line_number = int(payload.get("lineNumber") or 0)
+    is_masked = bool(payload.get("isMasked"))
+    triggered_by = str(payload.get("triggeredBy") or "").strip()
     extra_meta = payload.get("extraMeta") or {}
 
     if payload.get("readOnly") or config_path.startswith("/usr/share/omarchy"):
         return False, "Core Omarchy startup entries are read-only."
 
     if source == SourceKind.HYPRLAND_USER:
-        user_lua = HOME / ".config" / "hypr" / "autostart.lua"
-        if not user_lua.is_file():
-            return False, f"File not found: {user_lua}"
-        backup = user_lua.with_suffix(".lua.bak")
-        shutil.copy2(user_lua, backup)
+        target_file = Path(config_path) if config_path else (HOME / ".config" / "hypr" / "autostart.lua")
+        if not str(target_file).startswith(str(HOME) + "/") or not target_file.is_file():
+            return False, f"File not found: {target_file}"
+        backup = target_file.with_name(target_file.name + ".bak")
+        shutil.copy2(target_file, backup)
 
-        lines = user_lua.read_text(encoding="utf-8").splitlines()
+        lines = target_file.read_text(encoding="utf-8").splitlines()
         idx = line_number - 1
         if idx < 0 or idx >= len(lines):
             return False, "Line changed on disk — reload first."
 
+        hypr_fmt = extra_meta.get("hypr_format") or ("lua" if target_file.suffix == ".lua" else "conf")
         current = lines[idx].strip()
-        if enable:
-            updated = re.sub(r"^--\s*(?:\[disabled\]\s*)?", "", current)
-        else:
+        if hypr_fmt == "lua":
             clean = re.sub(r"^--\s*(?:\[disabled\]\s*)?", "", current)
-            updated = f"-- [disabled] {clean}"
+            updated = clean if enable else f"-- [disabled] {clean}"
+        else:
+            clean = re.sub(r"^#\s*(?:\[disabled\]\s*)?", "", current)
+            updated = clean if enable else f"# [disabled] {clean}"
 
         lines[idx] = updated
-        user_lua.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        ok, err = _validate_hyprland_or_rollback(user_lua, backup)
+        target_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        ok, err = _validate_hyprland_or_rollback(target_file, backup)
         if not ok:
             return False, err
+
+        if enable and pid == 0 and command:
+            _spawn_detached(["bash", "-lc", command])
+            return True, f"{name}: enabled & started"
+        if not enable and pid > 0:
+            stopped = _stop_user_process_safely(pid, command)
+            if stopped:
+                return True, f"{name}: disabled & stopped"
         return True, f"{name}: {'enabled' if enable else 'disabled'}"
 
     if source == SourceKind.HOOK_POST_BOOT:
@@ -130,6 +209,9 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
                     with open(usr_path, "w", encoding="utf-8") as fh:
                         cp.write(fh, space_around_delimiters=False)
             _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            if pid == 0 and command:
+                _spawn_detached(["bash", "-lc", command])
+                return True, f"{name}: enabled & started"
             return True, f"{name}: enabled"
         else:
             if usr_path.is_file():
@@ -144,25 +226,62 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
             else:
                 usr_path.write_text("[Desktop Entry]\nHidden=true\n", encoding="utf-8")
             _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            if pid > 0 and _stop_user_process_safely(pid, command):
+                return True, f"{name}: disabled & stopped"
             return True, f"{name}: disabled"
 
     if source == SourceKind.SYSTEMD_USER:
-        action = "enable" if enable else "disable"
-        rc, _, err = _run_cmd(
-            ["systemctl", "--user", action, "--now", unit_name], timeout=8.0
-        )
-        if rc != 0:
-            return False, err.strip() or "systemctl --user failed"
-        return True, f"{unit_name}: {'enabled' if enable else 'disabled'}"
+        if enable:
+            if is_masked:
+                _run_cmd(["systemctl", "--user", "unmask", unit_name], timeout=6.0)
+            rc, _, err = _run_cmd(
+                ["systemctl", "--user", "enable", "--now", unit_name], timeout=8.0
+            )
+            if rc != 0:
+                return False, err.strip() or "systemctl --user enable failed"
+            return True, f"{unit_name}: {'unmasked & enabled' if is_masked else 'enabled'}"
+        else:
+            companions = [u for u in triggered_by.split() if u and u != unit_name]
+            targets = [unit_name] + companions
+            rc, _, err = _run_cmd(
+                ["systemctl", "--user", "disable", "--now"] + targets, timeout=8.0
+            )
+            if rc != 0:
+                return False, err.strip() or "systemctl --user disable failed"
+            label = " + ".join(targets)
+            return True, f"{label}: disabled"
 
     if source == SourceKind.SYSTEMD_SYSTEM:
-        action = "enable" if enable else "disable"
-        rc, _, err = _run_cmd(
-            ["pkexec", "systemctl", action, "--now", unit_name], timeout=45.0
-        )
-        if rc != 0:
-            return False, err.strip() or "Authorization canceled"
-        return True, f"{unit_name}: {'enabled' if enable else 'disabled'}"
+        if enable:
+            if is_masked:
+                rc, _, err = _run_cmd(
+                    [
+                        "pkexec",
+                        "sh",
+                        "-c",
+                        'systemctl unmask "$1" && systemctl enable --now "$1"',
+                        "--",
+                        unit_name,
+                    ],
+                    timeout=45.0,
+                )
+            else:
+                rc, _, err = _run_cmd(
+                    ["pkexec", "systemctl", "enable", "--now", unit_name], timeout=45.0
+                )
+            if rc != 0:
+                return False, err.strip() or "Authorization canceled"
+            return True, f"{unit_name}: {'unmasked & enabled' if is_masked else 'enabled'}"
+        else:
+            companions = [u for u in triggered_by.split() if u and u != unit_name]
+            targets = [unit_name] + companions
+            rc, _, err = _run_cmd(
+                ["pkexec", "systemctl", "disable", "--now"] + targets, timeout=45.0
+            )
+            if rc != 0:
+                return False, err.strip() or "Authorization canceled"
+            label = " + ".join(targets)
+            return True, f"{label}: disabled"
 
     return False, "Unsupported startup source."
 
@@ -171,27 +290,38 @@ def add_hyprland_startup_entry(command: str) -> tuple[bool, str]:
     cmd = command.strip()
     if not cmd:
         return False, "Command cannot be empty."
-    user_lua = HOME / ".config" / "hypr" / "autostart.lua"
-    user_lua.parent.mkdir(parents=True, exist_ok=True)
-    backup = user_lua.with_suffix(".lua.bak")
-    if user_lua.is_file():
-        shutil.copy2(user_lua, backup)
-        existing = user_lua.read_text(encoding="utf-8")
-    else:
-        existing = "-- Extra autostart processes.\n"
 
-    new_line = f"o.launch_on_start({_lua_quote(cmd)})"
-    if new_line in existing.splitlines():
-        return False, "Already present in ~/.config/hypr/autostart.lua"
+    target_file, fmt = detect_hyprland_user_target()
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    backup = target_file.with_name(target_file.name + ".bak")
+
+    if target_file.is_file():
+        shutil.copy2(target_file, backup)
+        existing = target_file.read_text(encoding="utf-8")
+    else:
+        existing = (
+            "-- Extra autostart processes.\n"
+            if fmt == "lua"
+            else "# Autostart processes\n"
+        )
+
+    if fmt == "lua":
+        new_line = f"o.launch_on_start({_lua_quote(cmd)})"
+    else:
+        new_line = f"exec-once = {cmd}"
+
+    for ln in existing.splitlines():
+        if ln.strip() == new_line:
+            return False, f"Already present in {target_file.name}"
 
     if existing and not existing.endswith("\n"):
         existing += "\n"
-    user_lua.write_text(existing + new_line + "\n", encoding="utf-8")
+    target_file.write_text(existing + new_line + "\n", encoding="utf-8")
 
-    ok, err = _validate_hyprland_or_rollback(user_lua, backup)
+    ok, err = _validate_hyprland_or_rollback(target_file, backup)
     if not ok:
         return False, err
-    return True, f"Added '{cmd}' to autostart.lua"
+    return True, f"Added '{cmd}' to {target_file.name}"
 
 
 def add_post_boot_hook(name: str, description: str, script_body: str) -> tuple[bool, str]:
@@ -221,25 +351,29 @@ def delete_user_item_raw(payload: dict) -> tuple[bool, str]:
 
     source = SourceKind(payload["source"])
     name = payload.get("name", "")
+    command = payload.get("command", "")
+    pid = int(payload.get("pid") or 0)
     config_path = payload.get("configPath", "")
     line_number = int(payload.get("lineNumber") or 0)
 
     if source == SourceKind.HYPRLAND_USER:
-        user_lua = HOME / ".config" / "hypr" / "autostart.lua"
-        if not user_lua.is_file():
-            return False, "autostart.lua not found."
-        backup = user_lua.with_suffix(".lua.bak")
-        shutil.copy2(user_lua, backup)
-        lines = user_lua.read_text(encoding="utf-8").splitlines()
+        target_file = Path(config_path) if config_path else (HOME / ".config" / "hypr" / "autostart.lua")
+        if not str(target_file).startswith(str(HOME) + "/") or not target_file.is_file():
+            return False, f"{target_file.name} not found."
+        backup = target_file.with_name(target_file.name + ".bak")
+        shutil.copy2(target_file, backup)
+        lines = target_file.read_text(encoding="utf-8").splitlines()
         idx = line_number - 1
         if idx < 0 or idx >= len(lines):
             return False, "Line changed on disk — reload first."
         del lines[idx]
-        user_lua.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        ok, err = _validate_hyprland_or_rollback(user_lua, backup)
+        target_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        ok, err = _validate_hyprland_or_rollback(target_file, backup)
         if not ok:
             return False, err
-        return True, f"Removed '{name}' from autostart.lua"
+        if pid > 0:
+            _stop_user_process_safely(pid, command)
+        return True, f"Removed '{name}' from {target_file.name}"
 
     if source in (SourceKind.HOOK_POST_BOOT, SourceKind.XDG_AUTOSTART):
         p = Path(config_path)
@@ -247,6 +381,8 @@ def delete_user_item_raw(payload: dict) -> tuple[bool, str]:
             p.unlink()
             if source == SourceKind.XDG_AUTOSTART:
                 _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+                if pid > 0:
+                    _stop_user_process_safely(pid, command)
             return True, f"Removed '{name}'"
     return False, "Cannot delete this entry."
 
@@ -264,20 +400,118 @@ def run_item_now_raw(payload: dict) -> tuple[bool, str]:
         rc, _, err = _run_cmd(["pkexec", "systemctl", "restart", unit_name], timeout=45.0)
         return (rc == 0, f"Restarted {unit_name}" if rc == 0 else (err.strip() or "Canceled"))
     if command:
-        try:
-            subprocess.Popen(
-                ["uwsm-app", "--", "bash", "-lc", command],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+        if _spawn_detached(["bash", "-lc", command]):
             return True, f"Launched {name}"
-        except Exception as exc:
-            return False, str(exc)
+        return False, f"Failed to launch {name}"
     return False, "No runnable command."
 
 
-def fetch_unit_logs_raw(payload: dict, lines: int = 40) -> str:
+def _resolve_preferred_editor() -> str:
+    omarchy_ed_file = HOME / ".local" / "state" / "omarchy" / "defaults" / "editor"
+    if omarchy_ed_file.is_file():
+        try:
+            ed = omarchy_ed_file.read_text(encoding="utf-8").splitlines()[0].strip()
+            if ed and shutil.which(ed):
+                return ed
+        except OSError:
+            pass
+
+    for env_key in ("VISUAL", "EDITOR"):
+        val = os.environ.get(env_key, "").strip()
+        if not val or "omarchy-launch-editor" in val:
+            continue
+        try:
+            tok = shlex.split(val)[0]
+        except ValueError:
+            tok = val.split()[0]
+        if shutil.which(tok):
+            return tok
+
+    for candidate in ("nvim", "vim", "hx", "helix", "micro", "nano", "code", "zed"):
+        if shutil.which(candidate):
+            return candidate
+    return ""
+
+
+def _launch_tui_command(cmd_args: list[str]) -> bool:
+    if shutil.which("omarchy-launch-tui"):
+        return _spawn_detached(["omarchy-launch-tui"] + cmd_args)
+    if shutil.which("xdg-terminal-exec"):
+        return _spawn_detached(["xdg-terminal-exec", "-e"] + cmd_args)
+    term_env = os.environ.get("TERMINAL", "").strip()
+    if term_env and shutil.which(term_env):
+        return _spawn_detached([term_env, "-e"] + cmd_args)
+    for term in ("kitty", "alacritty", "foot", "ghostty", "wezterm"):
+        if shutil.which(term):
+            return _spawn_detached([term, "-e"] + cmd_args)
+    return False
+
+
+def open_in_editor_raw(payload: dict) -> tuple[bool, str]:
+    config_path = str(payload.get("configPath") or "").strip()
+    unit_name = str(payload.get("unitName") or "").strip()
+    source_val = str(payload.get("source") or "")
+    line_num = int(payload.get("lineNumber") or 0)
+
+    target = Path(config_path) if config_path else None
+    if (not target or not target.is_file() or str(target) == "/dev/null") and unit_name:
+        sub = "user" if source_val == SourceKind.SYSTEMD_USER.value else "system"
+        fallback = Path(f"/usr/lib/systemd/{sub}/{unit_name}")
+        if fallback.is_file():
+            target = fallback
+
+    if not target or not target.is_file():
+        return False, "Configuration file not found on disk."
+
+    editor = _resolve_preferred_editor()
+    ed_base = os.path.basename(editor) if editor else ""
+    tui_editors = {"nvim", "vim", "vi", "nano", "micro", "hx", "helix", "fresh"}
+
+    if ed_base in tui_editors:
+        if ed_base in ("hx", "helix"):
+            arg = f"{target}:{line_num}" if line_num > 0 else str(target)
+            cmd = [editor, arg]
+        elif line_num > 0 and ed_base in ("nvim", "vim", "vi", "nano", "micro"):
+            cmd = [editor, f"+{line_num}", str(target)]
+        else:
+            cmd = [editor, str(target)]
+        if _launch_tui_command(cmd):
+            return True, f"Opened {target.name} in {ed_base}"
+
+    if ed_base in ("code", "codium"):
+        loc = f"{target}:{line_num}" if line_num > 0 else str(target)
+        if _spawn_detached([editor, "--goto", loc]):
+            return True, f"Opened {target.name} in {ed_base}"
+    elif ed_base in ("zed", "zeditor", "subl"):
+        loc = f"{target}:{line_num}" if line_num > 0 else str(target)
+        if _spawn_detached([editor, loc]):
+            return True, f"Opened {target.name} in {ed_base}"
+    elif editor:
+        if _spawn_detached([editor, str(target)]):
+            return True, f"Opened {target.name} in {ed_base}"
+
+    if shutil.which("omarchy-launch-editor"):
+        if _spawn_detached(["omarchy-launch-editor", str(target)]):
+            return True, f"Opened {target.name}"
+
+    if shutil.which("xdg-open") and _spawn_detached(["xdg-open", str(target)]):
+        return True, f"Opened {target.name}"
+
+    return False, "No suitable editor found."
+
+
+def open_dir_raw(path_str: str) -> tuple[bool, str]:
+    p = Path(path_str) if path_str else None
+    if not p:
+        return False, "No path available."
+    folder = p.parent if (p.is_file() or p.is_symlink() or not p.is_dir()) else p
+    if folder.is_dir():
+        if _spawn_detached(["xdg-open", str(folder)]):
+            return False, f"Opened {folder}"
+    return False, "Directory not found."
+
+
+def fetch_unit_logs_raw(payload: dict, lines: int = 60) -> str:
     source = SourceKind(payload["source"])
     unit_name = payload.get("unitName", "")
     extra_meta = payload.get("extraMeta") or {}

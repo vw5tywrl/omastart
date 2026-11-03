@@ -8,7 +8,7 @@ Aggregates systemd units, Hyprland autostart commands, and Omarchy post-boot hoo
 
 - Arch Linux or Omarchy
 - Hyprland
-- Dependencies: `python`, `quickshell`, `pacman-contrib`, `systemd`
+- Dependencies: `python`, `quickshell`, `systemd`
 
 ## Install
 
@@ -36,11 +36,20 @@ To uninstall:
 
 Run `omastart` from terminal or your application launcher.
 
-- **Type to search**: filters by name, description, or package.
-- **Up / Down**: navigate items.
-- **Space**: toggle enabled / disabled.
-- **Enter**: open logs and details drawer.
-- **Escape**: close drawer or modal.
+- `j` / `k` or `Up` / `Down`: navigate
+- `Space`: toggle service
+- `u`: undo last toggle
+- `Enter`: inspect service details and logs
+- `e`: open config file in `$EDITOR` at exact line
+- `r`: restart / rerun service
+- `b`: view boot performance breakdown
+- `!`: filter failed units
+- `a`: add startup entry
+- `Tab`: switch between Packages and Layers view
+- `d`: show / hide disabled entries
+- `s`: cycle sort (default, boot time, name)
+- `/`: search filter
+- `Esc` or `q`: quit / close modal
 
 ### CLI
 

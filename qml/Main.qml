@@ -18,6 +18,8 @@ ShellRoot {
   property string bootUserspace: "—"
   property string bootGraphical: "—"
   property string bootRaw: ""
+  property var bootStages: []
+  property var slowestUnits: []
   property bool loading: true
   property bool busyAction: false
   property string statusMessage: ""
@@ -26,17 +28,23 @@ ShellRoot {
   property string viewMode: "packages"   // "packages" | "layers"
   property string scopeFilter: "all"     // "all" | "hyprland" | "xdg" | "systemd-user" | "systemd-system"
   property bool showDisabled: false
+  property bool filterFailedOnly: false
   property int sortMode: 0               // 0=default, 1=boot time, 2=name
   property string searchQuery: ""
 
-  // Unified cursor state (Omarchy single-cursor convention)
+  // Unified cursor & undo state
   property bool cursorActive: false
   property int cursorRowIndex: -1
+  property string cursorItemId: ""
+  property var lastToggledItem: null
+  property bool lastToggledPrevState: false
+  property var keepVisibleIds: ({})
 
   // Counts
   property int countEnabled: 0
   property int countPackages: 0
   property int countRunning: 0
+  property int countFailed: 0
   property var scopeCounts: ({ "all": 0, "hyprland": 0, "xdg": 0, "systemd-user": 0, "systemd-system": 0 })
 
   // Modal state
@@ -45,6 +53,7 @@ ShellRoot {
   property bool logsLoading: false
   property var confirmDisableItem: null
   property bool addModalOpen: false
+  property bool bootModalOpen: false
   property string addTab: "app"          // "app" | "hypr" | "hook"
   property int appCursorIndex: 0
 
@@ -60,6 +69,17 @@ ShellRoot {
     interval: 4000
     repeat: false
     onTriggered: app.statusMessage = ""
+  }
+
+  Timer {
+    id: appFocusTimer
+    interval: 50
+    repeat: false
+    onTriggered: {
+      if (app.addModalOpen && app.addTab === "app") {
+        appSearchInput.forceActiveFocus()
+      }
+    }
   }
 
   // Clipboard helper via hidden TextEdit (native Qt Wayland clipboard)
@@ -87,6 +107,8 @@ ShellRoot {
           app.bootUserspace = payload.userspaceTime || "—"
           app.bootGraphical = payload.graphicalTime || "—"
           app.bootRaw = payload.rawBreakdown || ""
+          app.bootStages = payload.stages || []
+          app.slowestUnits = payload.slowestUnits || []
           app.allItems = payload.items || []
           app.recomputeMetrics()
           app.rebuildRows()
@@ -173,7 +195,44 @@ ShellRoot {
       confirmDisableItem = item
       return
     }
+    lastToggledItem = item
+    lastToggledPrevState = item.enabled
+    cursorItemId = item.id
+    var kv = Object.assign({}, keepVisibleIds)
+    kv[item.id] = true
+    keepVisibleIds = kv
     runBackendAction("toggle", { item: item, enable: nextState })
+  }
+
+  function undoLastToggle() {
+    if (!lastToggledItem || busyAction) {
+      toast("Nothing to undo")
+      return
+    }
+    var target = lastToggledItem
+    var prev = lastToggledPrevState
+    lastToggledItem = null
+    cursorItemId = target.id
+    toast("Undo: " + target.name + " -> " + (prev ? "enabled" : "disabled"))
+    runBackendAction("toggle", { item: target, enable: prev })
+  }
+
+  function isAppAlreadyAdded(appObj) {
+    if (!appObj) return false
+    var targetCmd = (appObj.command || "").trim().toLowerCase()
+    var targetPkg = (appObj.pkgName || "").trim().toLowerCase()
+    var targetExe = targetCmd.split(/\s+/)[0].split("/").pop()
+
+    for (var i = 0; i < allItems.length; i++) {
+      var it = allItems[i]
+      if (!it.enabled) continue
+      if (targetPkg && it.pkgName && it.pkgName.toLowerCase() === targetPkg) return true
+      var itCmd = (it.command || "").trim().toLowerCase()
+      var itExe = itCmd.split(/\s+/)[0].split("/").pop()
+      if (targetExe && itExe && targetExe === itExe) return true
+      if (targetCmd && itCmd && itCmd.indexOf(targetCmd) >= 0) return true
+    }
+    return false
   }
 
   function openInspector(item) {
@@ -201,6 +260,7 @@ ShellRoot {
     } else {
       rebuildFilteredApps("")
     }
+    appFocusTimer.restart()
   }
 
   function rebuildFilteredApps(query) {
@@ -221,6 +281,7 @@ ShellRoot {
   function recomputeMetrics() {
     var enabledCnt = 0
     var runningCnt = 0
+    var failedCnt = 0
     var pkgSet = ({})
     var sc = { "all": 0, "hyprland": 0, "xdg": 0, "systemd-user": 0, "systemd-system": 0 }
 
@@ -231,7 +292,10 @@ ShellRoot {
         if (it.pkgName) pkgSet[it.pkgName] = true
         if (it.runningState === "running") runningCnt++
       }
-      if (showDisabled || it.enabled) {
+      if (it.runningState === "failed") {
+        failedCnt++
+      }
+      if (showDisabled || it.enabled || keepVisibleIds[it.id]) {
         sc["all"]++
         if (sc[it.category] !== undefined) sc[it.category]++
       }
@@ -239,6 +303,7 @@ ShellRoot {
     countEnabled = enabledCnt
     countPackages = Object.keys(pkgSet).length
     countRunning = runningCnt
+    countFailed = failedCnt
     scopeCounts = sc
   }
 
@@ -248,7 +313,8 @@ ShellRoot {
 
     for (var i = 0; i < allItems.length; i++) {
       var it = allItems[i]
-      if (!showDisabled && !it.enabled) continue
+      if (filterFailedOnly && it.runningState !== "failed") continue
+      if (!showDisabled && !it.enabled && !keepVisibleIds[it.id]) continue
       if (scopeFilter !== "all" && it.category !== scopeFilter) continue
       if (q.length > 0) {
         var hay = (
@@ -262,8 +328,16 @@ ShellRoot {
 
     var rows = []
 
-    // Explicit flat sort modes (Boot time or Name)
-    if (sortMode === 1 || sortMode === 2) {
+    if (filterFailedOnly) {
+      rows.push({
+        kind: "header",
+        title: "FAILED STARTUP UNITS  ·  " + filtered.length,
+        rightMeta: "Press ! or Esc to view all"
+      })
+      for (var fi = 0; fi < filtered.length; fi++) {
+        rows.push({ kind: "item", item: filtered[fi] })
+      }
+    } else if (sortMode === 1 || sortMode === 2) {
       filtered.sort(function(a, b) {
         if (sortMode === 1) {
           var ta = a.bootTimeMs >= 0 ? a.bootTimeMs : -1
@@ -349,7 +423,7 @@ ShellRoot {
         bySrc[sit.source].push(sit)
       }
       var layerPaths = {
-        "hyprland-user": "~/.config/hypr/autostart.lua",
+        "hyprland-user": "~/.config/hypr/",
         "hyprland-default": "/usr/share/omarchy/default/hypr/autostart.lua",
         "hook-post-boot": "~/.config/omarchy/hooks/post-boot.d/",
         "xdg-autostart": "/etc/xdg/autostart & ~/.config/autostart",
@@ -371,10 +445,26 @@ ShellRoot {
     }
 
     visibleRows = rows
-    // Clamp or reset cursor onto a valid item row
-    if (cursorRowIndex >= rows.length || (cursorRowIndex >= 0 && rows[cursorRowIndex].kind !== "item")) {
+
+    // Restore cursor position by item.id if possible
+    var restoredIdx = -1
+    if (cursorItemId.length > 0) {
+      for (var ri = 0; ri < rows.length; ri++) {
+        if (rows[ri].kind === "item" && rows[ri].item && rows[ri].item.id === cursorItemId) {
+          restoredIdx = ri
+          break
+        }
+      }
+    }
+
+    if (restoredIdx >= 0) {
+      cursorRowIndex = restoredIdx
+    } else if (cursorRowIndex >= rows.length || (cursorRowIndex >= 0 && rows[cursorRowIndex].kind !== "item")) {
       cursorRowIndex = firstItemRowIndex()
     }
+
+    var curIt = currentCursorItem()
+    cursorItemId = curIt ? curIt.id : ""
   }
 
   function firstItemRowIndex() {
@@ -397,6 +487,8 @@ ShellRoot {
     var idx = cursorRowIndex
     if (idx < 0) {
       cursorRowIndex = delta >= 0 ? firstItemRowIndex() : lastItemRowIndex()
+      var cur = currentCursorItem()
+      cursorItemId = cur ? cur.id : ""
       if (cursorRowIndex >= 0) listView.positionViewAtIndex(cursorRowIndex, ListView.Contain)
       return
     }
@@ -413,6 +505,8 @@ ShellRoot {
       stepsRemaining--
     }
     cursorRowIndex = candidate
+    var newCur = currentCursorItem()
+    cursorItemId = newCur ? newCur.id : ""
     // If right below a section header, reveal the header too when moving up
     if (step < 0 && candidate > 0 && visibleRows[candidate - 1].kind === "header") {
       listView.positionViewAtIndex(candidate - 1, ListView.Contain)
@@ -452,7 +546,7 @@ ShellRoot {
       anchors.fill: parent
       focus: true
 
-      readonly property bool modalOpen: app.inspectedItem !== null || app.confirmDisableItem !== null || app.addModalOpen
+      readonly property bool modalOpen: app.inspectedItem !== null || app.confirmDisableItem !== null || app.addModalOpen || app.bootModalOpen
 
       Keys.onPressed: function(event) {
         // 1. Confirm modal keys
@@ -463,7 +557,15 @@ ShellRoot {
           } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Y) {
             var target = app.confirmDisableItem
             app.confirmDisableItem = null
-            app.runBackendAction("toggle", { item: target, enable: false })
+            if (target) {
+              app.lastToggledItem = target
+              app.lastToggledPrevState = target.enabled
+              app.cursorItemId = target.id
+              var kv = Object.assign({}, app.keepVisibleIds)
+              kv[target.id] = true
+              app.keepVisibleIds = kv
+              app.runBackendAction("toggle", { item: target, enable: false })
+            }
             event.accepted = true
           }
           return
@@ -474,11 +576,48 @@ ShellRoot {
           if (event.key === Qt.Key_Escape || event.key === Qt.Key_Q) {
             app.inspectedItem = null
             event.accepted = true
+          } else if (event.key === Qt.Key_E) {
+            if (app.inspectedItem && app.inspectedItem.configPath && app.inspectedItem.configPath.indexOf("/") >= 0) {
+              app.runBackendAction("open-editor", { item: app.inspectedItem })
+            }
+            event.accepted = true
+          } else if (event.key === Qt.Key_R) {
+            if (app.inspectedItem) {
+              app.runBackendAction("run-now", { item: app.inspectedItem })
+            }
+            event.accepted = true
+          } else if (event.key === Qt.Key_X) {
+            if (app.inspectedItem && app.inspectedItem.canDelete && !app.inspectedItem.readOnly) {
+              app.runBackendAction("delete", { item: app.inspectedItem })
+            }
+            event.accepted = true
+          } else if (event.key === Qt.Key_J || event.key === Qt.Key_Down) {
+            if (inspScroll.contentItem && inspScroll.contentItem.contentY !== undefined) {
+              inspScroll.contentItem.contentY = Math.min(
+                Math.max(0, inspScroll.contentItem.contentHeight - inspScroll.height),
+                inspScroll.contentItem.contentY + 40
+              )
+            }
+            event.accepted = true
+          } else if (event.key === Qt.Key_K || event.key === Qt.Key_Up) {
+            if (inspScroll.contentItem && inspScroll.contentItem.contentY !== undefined) {
+              inspScroll.contentItem.contentY = Math.max(0, inspScroll.contentItem.contentY - 40)
+            }
+            event.accepted = true
           }
           return
         }
 
-        // 3. Add modal keys
+        // 3. Boot Breakdown modal keys
+        if (app.bootModalOpen) {
+          if (event.key === Qt.Key_Escape || event.key === Qt.Key_B || event.key === Qt.Key_Q) {
+            app.bootModalOpen = false
+            event.accepted = true
+          }
+          return
+        }
+
+        // 4. Add modal keys
         if (app.addModalOpen) {
           if (event.key === Qt.Key_Escape) {
             app.addModalOpen = false
@@ -487,6 +626,11 @@ ShellRoot {
             return
           }
           if (app.addTab === "app" && !appSearchInput.activeFocus) {
+            if (event.key === Qt.Key_Slash) {
+              appSearchInput.forceActiveFocus()
+              event.accepted = true
+              return
+            }
             if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
               if (app.appCursorIndex + 1 < app.filteredApps.length) {
                 app.appCursorIndex++
@@ -501,7 +645,12 @@ ShellRoot {
               event.accepted = true
             } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
               if (app.appCursorIndex >= 0 && app.appCursorIndex < app.filteredApps.length) {
-                app.runBackendAction("add-hypr", { command: app.filteredApps[app.appCursorIndex].command })
+                var selApp = app.filteredApps[app.appCursorIndex]
+                if (app.isAppAlreadyAdded(selApp)) {
+                  app.toast(selApp.name + " is already in startup")
+                } else {
+                  app.runBackendAction("add-hypr", { command: selApp.command })
+                }
               }
               event.accepted = true
             }
@@ -509,7 +658,7 @@ ShellRoot {
           return
         }
 
-        // 4. Search input focused
+        // 5. Search input focused
         if (filterInput.activeFocus) {
           if (event.key === Qt.Key_Escape) {
             if (filterInput.text.length > 0) {
@@ -526,13 +675,16 @@ ShellRoot {
           return
         }
 
-        // 5. Main keyboard navigation
+        // 6. Main keyboard navigation
         var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
         if (event.key === Qt.Key_Q || (ctrl && event.key === Qt.Key_W)) {
           Qt.quit()
           event.accepted = true
         } else if (event.key === Qt.Key_Escape) {
-          if (filterInput.text.length > 0) {
+          if (app.filterFailedOnly) {
+            app.filterFailedOnly = false
+            app.rebuildRows()
+          } else if (filterInput.text.length > 0) {
             filterInput.text = ""
           } else {
             Qt.quit()
@@ -567,11 +719,23 @@ ShellRoot {
           var cur = app.currentCursorItem()
           if (cur) app.requestToggle(cur)
           event.accepted = true
+        } else if (event.key === Qt.Key_U) {
+          app.undoLastToggle()
+          event.accepted = true
+        } else if (event.key === Qt.Key_B) {
+          app.bootModalOpen = !app.bootModalOpen
+          event.accepted = true
+        } else if (event.key === Qt.Key_Exclam) {
+          app.filterFailedOnly = !app.filterFailedOnly
+          app.rebuildRows()
+          app.toast(app.filterFailedOnly ? "Showing failed units only" : "All units")
+          event.accepted = true
         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
           var sel = app.currentCursorItem()
           if (sel) app.openInspector(sel)
           event.accepted = true
         } else if (event.key === Qt.Key_Tab) {
+          app.filterFailedOnly = false
           app.viewMode = (app.viewMode === "packages") ? "layers" : "packages"
           app.rebuildRows()
           event.accepted = true
@@ -645,17 +809,28 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             spacing: 6
 
+            OmaButton {
+              visible: app.countFailed > 0
+              text: "× " + app.countFailed + " FAILED"
+              dangerStyle: true
+              active: app.filterFailedOnly
+              onClicked: {
+                app.filterFailedOnly = !app.filterFailedOnly
+                app.rebuildRows()
+              }
+            }
+
             Row {
               spacing: 0
               OmaButton {
                 text: "PACKAGES"
-                active: app.viewMode === "packages"
-                onClicked: { app.viewMode = "packages"; app.rebuildRows() }
+                active: app.viewMode === "packages" && !app.filterFailedOnly
+                onClicked: { app.filterFailedOnly = false; app.viewMode = "packages"; app.rebuildRows() }
               }
               OmaButton {
                 text: "LAYERS"
-                active: app.viewMode === "layers"
-                onClicked: { app.viewMode = "layers"; app.rebuildRows() }
+                active: app.viewMode === "layers" && !app.filterFailedOnly
+                onClicked: { app.filterFailedOnly = false; app.viewMode = "layers"; app.rebuildRows() }
               }
             }
 
@@ -699,13 +874,16 @@ ShellRoot {
             }
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontSmall
-            color: OmaTheme.muted
+            color: statsMouse.containsMouse ? OmaTheme.accent : OmaTheme.muted
 
             MouseArea {
+              id: statsMouse
               anchors.fill: parent
               hoverEnabled: true
-              onEntered: if (app.bootRaw) app.statusMessage = app.bootRaw.replace(/\n/g, "  |  ")
+              cursorShape: Qt.PointingHandCursor
+              onEntered: if (app.bootRaw) app.statusMessage = "Click for boot breakdown (or press 'b')"
               onExited: app.statusMessage = ""
+              onClicked: app.bootModalOpen = true
             }
           }
         }
@@ -1043,8 +1221,8 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             visible: parent.width >= 520
             text: parent.width >= 760
-              ? "j/k move  ·  Space toggle  ·  Enter inspect  ·  / search  ·  Tab view  ·  d disabled  ·  a add  ·  q quit"
-              : "j/k  ·  Space  ·  Enter  ·  /  ·  Tab  ·  d  ·  a  ·  q"
+              ? "j/k move  ·  Space toggle  ·  u undo  ·  Enter inspect  ·  b boot  ·  / search  ·  Tab view  ·  d disabled  ·  a add  ·  q quit"
+              : "j/k  ·  Space  ·  u  ·  Enter  ·  b  ·  /  ·  Tab  ·  d  ·  a  ·  q"
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontCaption
             color: OmaTheme.dim
@@ -1129,14 +1307,19 @@ ShellRoot {
             onEntered: {
               app.cursorActive = true
               app.cursorRowIndex = rowIdx
+              app.cursorItemId = itemRect.it.id
             }
             onPositionChanged: {
               if (!app.cursorActive || app.cursorRowIndex !== rowIdx) {
                 app.cursorActive = true
                 app.cursorRowIndex = rowIdx
+                app.cursorItemId = itemRect.it.id
               }
             }
-            onClicked: app.openInspector(itemRect.it)
+            onClicked: {
+              app.cursorItemId = itemRect.it.id
+              app.openInspector(itemRect.it)
+            }
           }
 
           // Status dot
@@ -1370,11 +1553,14 @@ ShellRoot {
                       { k: "PACKAGE", v: it.pkgName ? (it.pkgName + (it.pkgVersion ? " " + it.pkgVersion : "") + (it.pkgSize ? "  (" + it.pkgSize + ")" : "")) : "user / local" },
                       { k: "SUMMARY", v: it.pkgDesc || it.description || "—" },
                       { k: "LAYER",   v: it.sourceLabel },
-                      { k: "STATUS",  v: it.runningLabel + (it.bootTimeText ? "  ·  boot " + it.bootTimeText : "") },
-                      { k: "CONFIG",  v: it.configPath || "—" },
-                      { k: "BINARY",  v: it.binaryPath || "—" },
-                      { k: "COMMAND", v: it.command || "—" }
+                      { k: "STATUS",  v: it.runningLabel + (it.bootTimeText ? "  ·  boot " + it.bootTimeText : "") }
                     ]
+                    if (it.pid && it.pid > 0) rows.push({ k: "PID", v: String(it.pid) })
+                    if (it.triggeredBy) rows.push({ k: "TRIGGERED BY", v: it.triggeredBy })
+                    if (it.isMasked) rows.push({ k: "MASKED", v: "Unit is masked (symlinked to /dev/null)" })
+                    rows.push({ k: "CONFIG",  v: it.configPath || "—" })
+                    rows.push({ k: "BINARY",  v: it.binaryPath || "—" })
+                    rows.push({ k: "COMMAND", v: it.command || "—" })
                     if (it.pkgReason) rows.push({ k: "INSTALL", v: it.pkgReason + (it.pkgUrl ? "  ·  " + it.pkgUrl : "") })
                     if (it.readOnly && it.readOnlyReason) rows.push({ k: "NOTE", v: it.readOnlyReason })
                     return rows
@@ -1385,7 +1571,7 @@ ShellRoot {
                     spacing: 12
 
                     Text {
-                      width: 76
+                      width: 88
                       text: modelData.k
                       font.family: OmaTheme.fontFamily
                       font.pixelSize: OmaTheme.fontCaption
@@ -1394,7 +1580,7 @@ ShellRoot {
                     }
 
                     Text {
-                      width: parent.width - 88
+                      width: parent.width - 100
                       wrapMode: Text.WrapAnywhere
                       textFormat: Text.PlainText
                       text: modelData.v
@@ -1457,9 +1643,28 @@ ShellRoot {
               height: 26
 
               OmaButton {
-                text: "RUN / RESTART"
+                visible: app.inspectedItem !== null && app.inspectedItem.configPath && app.inspectedItem.configPath.indexOf("/") >= 0
+                text: "EDIT · E"
+                onClicked: if (app.inspectedItem) app.runBackendAction("open-editor", { item: app.inspectedItem })
+              }
+
+              OmaButton {
+                text: "RUN / RESTART · R"
                 accentStyle: true
                 onClicked: if (app.inspectedItem) app.runBackendAction("run-now", { item: app.inspectedItem })
+              }
+
+              OmaButton {
+                visible: app.inspectedItem !== null && app.inspectedItem.isMasked
+                text: "UNMASK & ENABLE"
+                accentStyle: true
+                onClicked: {
+                  if (app.inspectedItem) {
+                    var it = app.inspectedItem
+                    app.inspectedItem = null
+                    app.runBackendAction("toggle", { item: it, enable: true })
+                  }
+                }
               }
 
               OmaButton {
@@ -1489,7 +1694,7 @@ ShellRoot {
 
               OmaButton {
                 visible: app.inspectedItem !== null && app.inspectedItem.canDelete && !app.inspectedItem.readOnly
-                text: "REMOVE"
+                text: "REMOVE · X"
                 dangerStyle: true
                 onClicked: if (app.inspectedItem) app.runBackendAction("delete", { item: app.inspectedItem })
               }
@@ -1499,7 +1704,284 @@ ShellRoot {
       }
 
       // ======================================================================
-      // MODAL 2: Add Startup Entry
+      // MODAL 2: Boot Breakdown
+      // ======================================================================
+      Rectangle {
+        anchors.fill: parent
+        visible: app.bootModalOpen
+        color: OmaTheme.scrim
+        z: 22
+
+        MouseArea {
+          anchors.fill: parent
+          onClicked: app.bootModalOpen = false
+        }
+
+        Rectangle {
+          id: bootBreakdownCard
+          anchors.centerIn: parent
+          width: Math.min(parent.width - 36, 680)
+          height: Math.min(parent.height - 36, 480)
+          radius: OmaTheme.cornerRadius
+          color: OmaTheme.surface
+          border.width: 1
+          border.color: OmaTheme.accent
+
+          MouseArea { anchors.fill: parent } // swallow inside clicks
+
+          Column {
+            anchors.fill: parent
+            anchors.margins: 16
+            spacing: 12
+
+            // Header
+            Item {
+              width: parent.width
+              height: 24
+
+              Text {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "BOOT BREAKDOWN"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSubtitle
+                font.bold: true
+                color: OmaTheme.foreground
+              }
+
+              OmaButton {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: "ESC"
+                hPad: 8
+                vPad: 3
+                onClicked: app.bootModalOpen = false
+              }
+            }
+
+            Rectangle { width: parent.width; height: 1; color: OmaTheme.hairline }
+
+            // 3 Summary Cards
+            Row {
+              width: parent.width
+              spacing: 10
+
+              Repeater {
+                model: [
+                  { label: "TOTAL BOOT", val: app.bootTotal, col: OmaTheme.foreground },
+                  { label: "USERSPACE", val: app.bootUserspace, col: OmaTheme.accent },
+                  { label: "GRAPHICAL TARGET", val: app.bootGraphical, col: OmaTheme.green }
+                ]
+
+                delegate: Rectangle {
+                  width: (parent.width - 20) / 3
+                  height: 54
+                  radius: OmaTheme.cornerRadius
+                  color: OmaTheme.background
+                  border.width: 1
+                  border.color: OmaTheme.hairline
+
+                  Column {
+                    anchors.centerIn: parent
+                    spacing: 2
+
+                    Text {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      text: modelData.label
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontCaption
+                      font.letterSpacing: 1.0
+                      font.bold: true
+                      color: OmaTheme.muted
+                    }
+
+                    Text {
+                      anchors.horizontalCenter: parent.horizontalCenter
+                      text: modelData.val
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontSubtitle
+                      font.bold: true
+                      color: modelData.col
+                    }
+                  }
+                }
+              }
+            }
+
+            // Stages Proportional Timeline Bar
+            Column {
+              width: parent.width
+              spacing: 6
+              visible: app.bootStages && app.bootStages.length > 0
+
+              Text {
+                text: "STAGES TIMELINE"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontCaption
+                font.bold: true
+                font.letterSpacing: 1.0
+                color: OmaTheme.muted
+              }
+
+              Rectangle {
+                width: parent.width
+                height: 18
+                radius: OmaTheme.cornerRadius
+                color: OmaTheme.background
+                clip: true
+
+                Row {
+                  anchors.fill: parent
+                  spacing: 0
+
+                  Repeater {
+                    model: app.bootStages
+                    delegate: Rectangle {
+                      readonly property var colors: [OmaTheme.blue, OmaTheme.magenta, OmaTheme.yellow, OmaTheme.green]
+                      width: Math.max(2, (parent.width * (modelData.percent || 0)) / 100)
+                      height: parent.height
+                      color: colors[index % colors.length]
+                    }
+                  }
+                }
+              }
+
+              // Stages Legend
+              Row {
+                width: parent.width
+                spacing: 14
+
+                Repeater {
+                  model: app.bootStages
+                  delegate: Row {
+                    readonly property var colors: [OmaTheme.blue, OmaTheme.magenta, OmaTheme.yellow, OmaTheme.green]
+                    spacing: 5
+                    anchors.verticalCenter: parent.verticalCenter
+
+                    Rectangle {
+                      width: 8
+                      height: 8
+                      radius: 4
+                      color: colors[index % colors.length]
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      text: modelData.label + " " + modelData.text + " (" + Math.round(modelData.percent) + "%)"
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontCaption
+                      color: OmaTheme.muted
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+                }
+              }
+            }
+
+            Rectangle { width: parent.width; height: 1; color: OmaTheme.hairline }
+
+            // Slowest Startup Units Section
+            Text {
+              text: "SLOWEST STARTUP UNITS"
+              font.family: OmaTheme.fontFamily
+              font.pixelSize: OmaTheme.fontCaption
+              font.bold: true
+              font.letterSpacing: 1.0
+              color: OmaTheme.muted
+            }
+
+            ListView {
+              id: slowestListView
+              width: parent.width
+              height: parent.height - 230
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              model: app.slowestUnits
+
+              ScrollBar.vertical: ScrollBar {
+                policy: ScrollBar.AsNeeded
+                width: 4
+                contentItem: Rectangle {
+                  implicitWidth: 4
+                  color: OmaTheme.rgba(OmaTheme.foreground, 0.22)
+                }
+              }
+
+              delegate: Rectangle {
+                id: slowUnitRow
+                width: slowestListView.width - 8
+                height: 28
+                radius: OmaTheme.cornerRadius
+                color: slowMouse.containsMouse ? OmaTheme.hoverFill : "transparent"
+
+                MouseArea {
+                  id: slowMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    app.bootModalOpen = false
+                    app.openInspector(modelData)
+                  }
+                }
+
+                Text {
+                  id: slowTime
+                  anchors.left: parent.left
+                  anchors.leftMargin: 8
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: 60
+                  text: modelData.bootTimeText
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSmall
+                  font.bold: true
+                  color: modelData.bootTimeMs >= 5000 ? OmaTheme.red : OmaTheme.yellow
+                }
+
+                Text {
+                  id: slowName
+                  anchors.left: slowTime.right
+                  anchors.leftMargin: 10
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.min(implicitWidth, 220)
+                  elide: Text.ElideRight
+                  text: modelData.name
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontBody
+                  color: OmaTheme.foreground
+                }
+
+                Text {
+                  anchors.left: slowName.right
+                  anchors.leftMargin: 12
+                  anchors.right: slowInspectHint.left
+                  anchors.rightMargin: 10
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight
+                  text: modelData.description || modelData.command
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSmall
+                  color: OmaTheme.faint
+                }
+
+                Text {
+                  id: slowInspectHint
+                  anchors.right: parent.right
+                  anchors.rightMargin: 8
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "inspect →"
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontCaption
+                  color: slowMouse.containsMouse ? OmaTheme.accent : OmaTheme.dim
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // ======================================================================
+      // MODAL 3: Add Startup Entry
       // ======================================================================
       Rectangle {
         anchors.fill: parent
@@ -1540,7 +2022,7 @@ ShellRoot {
                 OmaButton {
                   text: "INSTALLED PACKAGES"
                   active: app.addTab === "app"
-                  onClicked: app.addTab = "app"
+                  onClicked: { app.addTab = "app"; appFocusTimer.restart() }
                 }
                 OmaButton {
                   text: "HYPRLAND CMD"
@@ -1592,7 +2074,20 @@ ShellRoot {
                   font.family: OmaTheme.fontFamily
                   font.pixelSize: OmaTheme.fontBody
                   onTextChanged: app.rebuildFilteredApps(text)
-                  Keys.onDownPressed: rootScope.forceActiveFocus()
+                  Keys.onDownPressed: {
+                    rootScope.forceActiveFocus()
+                    if (app.appCursorIndex < 0 && app.filteredApps.length > 0) app.appCursorIndex = 0
+                  }
+                  Keys.onReturnPressed: {
+                    if (app.appCursorIndex >= 0 && app.appCursorIndex < app.filteredApps.length) {
+                      var selApp = app.filteredApps[app.appCursorIndex]
+                      if (app.isAppAlreadyAdded(selApp)) {
+                        app.toast(selApp.name + " is already in startup")
+                      } else {
+                        app.runBackendAction("add-hypr", { command: selApp.command })
+                      }
+                    }
+                  }
                   Keys.onEscapePressed: { app.addModalOpen = false; rootScope.forceActiveFocus() }
 
                   Text {
@@ -1617,6 +2112,7 @@ ShellRoot {
 
                 delegate: Rectangle {
                   readonly property bool sel: index === app.appCursorIndex
+                  readonly property bool already: app.isAppAlreadyAdded(modelData)
                   width: appsListView.width
                   height: 28
                   radius: OmaTheme.cornerRadius
@@ -1664,11 +2160,11 @@ ShellRoot {
                     anchors.right: parent.right
                     anchors.rightMargin: 10
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "+ add"
+                    text: already ? "added" : "+ add"
                     font.family: OmaTheme.fontFamily
                     font.pixelSize: OmaTheme.fontCaption
                     font.bold: true
-                    color: sel ? OmaTheme.accent : OmaTheme.muted
+                    color: already ? OmaTheme.faint : (sel ? OmaTheme.accent : OmaTheme.muted)
                   }
 
                   MouseArea {
@@ -1676,7 +2172,13 @@ ShellRoot {
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onEntered: app.appCursorIndex = index
-                    onClicked: app.runBackendAction("add-hypr", { command: modelData.command })
+                    onClicked: {
+                      if (app.isAppAlreadyAdded(modelData)) {
+                        app.toast(modelData.name + " is already in startup")
+                      } else {
+                        app.runBackendAction("add-hypr", { command: modelData.command })
+                      }
+                    }
                   }
                 }
               }
@@ -1689,7 +2191,7 @@ ShellRoot {
               spacing: 10
 
               Text {
-                text: "Appends o.launch_on_start(\"...\") to ~/.config/hypr/autostart.lua"
+                text: "Appends autostart command to ~/.config/hypr/autostart.lua or autostart.conf"
                 font.family: OmaTheme.fontFamily
                 font.pixelSize: OmaTheme.fontSmall
                 color: OmaTheme.muted
@@ -1730,7 +2232,7 @@ ShellRoot {
               }
 
               OmaButton {
-                text: "ADD TO AUTOSTART.LUA"
+                text: "ADD TO AUTOSTART"
                 accentStyle: true
                 onClicked: app.runBackendAction("add-hypr", { command: hyprCmdInput.text })
               }
@@ -1828,7 +2330,7 @@ ShellRoot {
       }
 
       // ======================================================================
-      // MODAL 3: Critical Service Confirmation
+      // MODAL 4: Critical Service Confirmation
       // ======================================================================
       Rectangle {
         anchors.fill: parent
@@ -1886,7 +2388,15 @@ ShellRoot {
                 onClicked: {
                   var target = app.confirmDisableItem
                   app.confirmDisableItem = null
-                  if (target) app.runBackendAction("toggle", { item: target, enable: false })
+                  if (target) {
+                    app.lastToggledItem = target
+                    app.lastToggledPrevState = target.enabled
+                    app.cursorItemId = target.id
+                    var kv = Object.assign({}, app.keepVisibleIds)
+                    kv[target.id] = true
+                    app.keepVisibleIds = kv
+                    app.runBackendAction("toggle", { item: target, enable: false })
+                  }
                 }
               }
             }

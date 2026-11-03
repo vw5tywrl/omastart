@@ -6,7 +6,7 @@ pkgdesc="Dead-simple startup package and service manager for Omarchy and Hyprlan
 arch=('any')
 url="https://github.com/vw5tywrl/omastart"
 license=('MIT')
-depends=('python' 'quickshell' 'pacman-contrib' 'hicolor-icon-theme')
+depends=('python' 'quickshell' 'hicolor-icon-theme')
 optdepends=(
     'systemd: service inspection and log viewer'
     'hyprland: autostart.conf management'

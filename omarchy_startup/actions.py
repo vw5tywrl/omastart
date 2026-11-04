@@ -114,6 +114,25 @@ def _lua_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def _write_autostart_desktop_entry(
+    usr_path: Path, name: str, comment: str, command: str, icon: str = ""
+) -> None:
+    usr_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "[Desktop Entry]",
+        "Type=Application",
+        f"Name={name}",
+    ]
+    if comment and comment != "Installed desktop application":
+        lines.append(f"Comment={comment}")
+    lines.append(f"Exec={command}")
+    if icon:
+        lines.append(f"Icon={icon}")
+    lines.append("Terminal=false")
+    lines.append("X-Omastart-Managed=true")
+    usr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
     source = SourceKind(payload["source"])
     config_path = payload.get("configPath", "")
@@ -186,14 +205,43 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
                 p.rename(target)
             return True, f"{name}: hook disabled"
 
+    if source == SourceKind.DESKTOP_APP:
+        desktop_id = extra_meta.get("desktop_id") or unit_name
+        if not desktop_id:
+            return False, "Missing desktop entry ID."
+        if not desktop_id.endswith(".desktop"):
+            desktop_id += ".desktop"
+        usr_path = HOME / ".config" / "autostart" / desktop_id
+        if enable:
+            if not command:
+                return False, "Application has no launch command."
+            desc = str(payload.get("description") or "").strip()
+            icon = str(extra_meta.get("icon") or "").strip()
+            _write_autostart_desktop_entry(usr_path, name or desktop_id, desc, command, icon)
+            _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            return True, f"{name}: enabled at login"
+        else:
+            usr_path.unlink(missing_ok=True)
+            _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            return True, f"{name}: disabled at login"
+
     if source == SourceKind.XDG_AUTOSTART:
         desktop_id = extra_meta.get("desktop_id") or unit_name
         has_sys = extra_meta.get("has_sys") == "1"
+        omastart_managed = extra_meta.get("omastart_managed") == "1"
+        app_desktop_path = str(extra_meta.get("app_desktop_path") or "")
         user_dir = HOME / ".config" / "autostart"
         user_dir.mkdir(parents=True, exist_ok=True)
         usr_path = user_dir / desktop_id
 
         if enable:
+            if not usr_path.is_file() and not has_sys and command:
+                desc = str(payload.get("description") or "").strip()
+                icon = str(extra_meta.get("icon") or "").strip()
+                _write_autostart_desktop_entry(usr_path, name or desktop_id, desc, command, icon)
+                _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+                return True, f"{name}: enabled at login"
+
             if usr_path.is_file():
                 cp = configparser.ConfigParser(interpolation=None, strict=False)
                 cp.optionxform = str
@@ -211,11 +259,18 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
                     with open(usr_path, "w", encoding="utf-8") as fh:
                         cp.write(fh, space_around_delimiters=False)
             _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            if omastart_managed:
+                return True, f"{name}: enabled at login"
             if pid == 0 and command:
                 _spawn_detached(["bash", "-lc", command])
                 return True, f"{name}: enabled & started"
             return True, f"{name}: enabled"
         else:
+            if not has_sys and omastart_managed and app_desktop_path and Path(app_desktop_path).is_file():
+                usr_path.unlink(missing_ok=True)
+                _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+                return True, f"{name}: disabled at login"
+
             if usr_path.is_file():
                 cp = configparser.ConfigParser(interpolation=None, strict=False)
                 cp.optionxform = str
@@ -610,6 +665,7 @@ def save_snapshot_raw(name: str = "") -> tuple[bool, str]:
                 "lineNumber": it.line_number or 0,
             }
             for it in summary.items
+            if it.source != SourceKind.DESKTOP_APP
         ],
     }
     file_path = SNAPSHOT_DIR / f"{snap_id}.json"
@@ -660,8 +716,11 @@ def restore_snapshot_raw(snap_id: str) -> tuple[bool, str]:
     curr_map = {it.id: it for it in summary.items}
     restored_cnt = 0
 
+    snap_ids: set[str] = set()
     for rec in data.get("items", []):
         rec_id = rec.get("id")
+        if rec_id:
+            snap_ids.add(rec_id)
         rec_enabled = rec.get("enabled", True)
         if rec_id in curr_map:
             curr_item = curr_map[rec_id]
@@ -669,6 +728,18 @@ def restore_snapshot_raw(snap_id: str) -> tuple[bool, str]:
                 ok, _ = set_item_enabled_raw(curr_item.to_ui_dict(), rec_enabled)
                 if ok:
                     restored_cnt += 1
+
+    # Also disable any omastart-managed desktop autostart added after the snapshot
+    for it in summary.items:
+        if (
+            it.source == SourceKind.XDG_AUTOSTART
+            and it.enabled
+            and it.extra_meta.get("omastart_managed") == "1"
+            and it.id not in snap_ids
+        ):
+            ok, _ = set_item_enabled_raw(it.to_ui_dict(), False)
+            if ok:
+                restored_cnt += 1
 
     return True, f"Restored snapshot '{data.get('label', snap_id)}' ({restored_cnt} changes applied)"
 

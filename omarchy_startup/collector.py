@@ -689,6 +689,34 @@ def _parse_desktop_file(path: Path) -> dict[str, str]:
     return dict(cp["Desktop Entry"])
 
 
+def _desktop_app_dirs() -> list[Path]:
+    return [
+        HOME / ".local" / "share" / "applications",
+        HOME / ".local" / "share" / "flatpak" / "exports" / "share" / "applications",
+        Path("/var/lib/flatpak/exports/share/applications"),
+        Path("/usr/local/share/applications"),
+        Path("/usr/share/applications"),
+    ]
+
+
+def _find_app_desktop_path(desktop_id: str) -> str:
+    for d in _desktop_app_dirs():
+        cand = d / desktop_id
+        if cand.is_file():
+            return str(cand)
+    return ""
+
+
+def _clean_desktop_exec(exec_raw: str, terminal: bool = False) -> str:
+    cmd = re.sub(r"\s+%[fFuUdDnNickvm]\b", "", exec_raw).strip()
+    cmd = re.sub(r"\s+--\s*$", "", cmd).strip()
+    if terminal and cmd and shutil.which("xdg-terminal-exec"):
+        first = os.path.basename(_extract_first_executable(cmd))
+        if first not in ("xdg-terminal-exec", "omarchy-launch-tui"):
+            cmd = f"xdg-terminal-exec -e {cmd}"
+    return cmd
+
+
 def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
     sys_dir = Path("/etc/xdg/autostart")
     user_dir = HOME / ".config" / "autostart"
@@ -743,7 +771,10 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
         name = merged.get("name") or desktop_id.removesuffix(".desktop")
         comment = merged.get("comment") or "XDG autostart entry"
         exec_raw = merged.get("exec", "")
-        exec_cmd = re.sub(r"\s+%[fFuUdDnNickvm]\b", "", exec_raw).strip()
+        is_term = merged.get("terminal", "").lower() == "true"
+        exec_cmd = _clean_desktop_exec(exec_raw, terminal=is_term)
+        omastart_managed = merged.get("x-omastart-managed", "").lower() == "true"
+        app_desktop_path = _find_app_desktop_path(desktop_id)
 
         bin_path = _resolve_binary_path(exec_cmd)
         exe_base = os.path.basename(_extract_first_executable(exec_cmd))
@@ -753,6 +784,8 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
             r_state, r_label = "inactive", "disabled"
         elif pid is not None:
             r_state, r_label = "running", "active"
+        elif omastart_managed:
+            r_state, r_label = "inactive", "on login"
         else:
             r_state, r_label = "oneshot_done", "done"
 
@@ -780,6 +813,9 @@ def _collect_xdg_items(procs: list[tuple[int, str, str]]) -> list[StartupItem]:
                 "has_sys": "1" if has_sys else "0",
                 "has_usr": "1" if has_usr else "0",
                 "sys_path": str(sys_path) if has_sys else "",
+                "app_desktop_path": app_desktop_path,
+                "omastart_managed": "1" if omastart_managed else "0",
+                "icon": merged.get("icon", "").strip(),
             },
         )
         items.append(item)
@@ -1151,8 +1187,9 @@ def _enrich_packages(items: list[StartupItem]) -> None:
     for item in items:
         candidates: list[str] = []
         raw_probes = [
-            item.binary_path,
             item.extra_meta.get("sys_path", ""),
+            item.extra_meta.get("app_desktop_path", ""),
+            item.binary_path,
             item.config_path,
         ]
         # For masked units where config_path points to /dev/null, also check /usr/lib/systemd/...
@@ -1213,6 +1250,162 @@ def _enrich_packages(items: list[StartupItem]) -> None:
                     break
 
 
+def _load_launcher_hidden_stems() -> set[str]:
+    hides_file = OMARCHY_PATH / "default" / "omarchy" / "launcher.hides"
+    hidden_ids: set[str] = {"omastart", "io.omarchy.startup"}
+    if hides_file.is_file():
+        try:
+            for ln in hides_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                stem = ln.strip().removesuffix(".desktop")
+                if stem:
+                    hidden_ids.add(stem)
+        except OSError:
+            pass
+    return hidden_ids
+
+
+_MULTI_APP_WRAPPERS = {
+    "libreoffice",
+    "soffice",
+    "xdg-terminal-exec",
+    "omarchy-launch-webapp",
+    "omarchy-launch-or-focus-webapp",
+    "omarchy-launch-tui",
+    "omarchy-launch-or-focus",
+    "omarchy-shell",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "env",
+    "flatpak",
+    "python",
+    "python3",
+}
+
+
+def _collect_desktop_app_items(
+    procs: list[tuple[int, str, str]],
+    existing_items: list[StartupItem],
+) -> list[StartupItem]:
+    """Collect installed desktop applications not yet registered as startup entries."""
+    hidden_ids = _load_launcher_hidden_stems()
+    current_desktops = set(
+        d.strip()
+        for d in os.environ.get("XDG_CURRENT_DESKTOP", "Hyprland").split(":")
+        if d.strip()
+    )
+
+    existing_xdg_ids: set[str] = set()
+    existing_cmds: set[str] = set()
+    existing_exes: set[str] = set()
+
+    for it in existing_items:
+        if it.source == SourceKind.XDG_AUTOSTART:
+            if it.unit_name:
+                existing_xdg_ids.add(it.unit_name)
+            did = it.extra_meta.get("desktop_id", "")
+            if did:
+                existing_xdg_ids.add(did)
+        if it.source in (
+            SourceKind.HYPRLAND_DEFAULT,
+            SourceKind.HYPRLAND_USER,
+            SourceKind.XDG_AUTOSTART,
+        ):
+            cmd_norm = it.command.strip().lower()
+            if cmd_norm:
+                existing_cmds.add(cmd_norm)
+            exe = os.path.basename(_extract_first_executable(it.command)).lower()
+            if exe and exe not in _MULTI_APP_WRAPPERS:
+                existing_exes.add(exe)
+
+    items: list[StartupItem] = []
+    seen_ids: set[str] = set()
+    seen_names: set[str] = set()
+
+    for d in _desktop_app_dirs():
+        if not d.is_dir():
+            continue
+        for p in sorted(d.glob("*.desktop")):
+            stem = p.stem
+            if p.name in seen_ids or stem in hidden_ids:
+                continue
+            seen_ids.add(p.name)
+            if p.name in existing_xdg_ids:
+                continue
+
+            entry = _parse_desktop_file(p)
+            if not entry:
+                continue
+            if entry.get("nodisplay", "").lower() == "true":
+                continue
+            if entry.get("hidden", "").lower() == "true":
+                continue
+
+            only_show = [
+                x.strip() for x in entry.get("onlyshowin", "").split(";") if x.strip()
+            ]
+            not_show = [
+                x.strip() for x in entry.get("notshowin", "").split(";") if x.strip()
+            ]
+            if only_show and not (current_desktops & set(only_show)):
+                continue
+            if not_show and (current_desktops & set(not_show)):
+                continue
+
+            name = entry.get("name", "").strip()
+            exec_raw = entry.get("exec", "").strip()
+            if not name or not exec_raw:
+                continue
+
+            is_term = entry.get("terminal", "").lower() == "true"
+            clean_cmd = _clean_desktop_exec(exec_raw, terminal=is_term)
+            if not clean_cmd or name.lower() in seen_names:
+                continue
+
+            exe_base = os.path.basename(_extract_first_executable(clean_cmd))
+            if clean_cmd.lower() in existing_cmds:
+                continue
+            if exe_base and exe_base.lower() not in _MULTI_APP_WRAPPERS and exe_base.lower() in existing_exes:
+                continue
+
+            seen_names.add(name.lower())
+            bin_path = _resolve_binary_path(clean_cmd)
+            if _is_executable_uninstalled(clean_cmd, bin_path):
+                continue
+
+            pid = _match_process(exe_base, clean_cmd, procs)
+            comment = entry.get("comment", "").strip() or "Installed desktop application"
+
+            items.append(
+                StartupItem(
+                    id=f"xdg:{p.name}",
+                    name=name,
+                    description=comment,
+                    command=clean_cmd,
+                    source=SourceKind.DESKTOP_APP,
+                    enabled=False,
+                    running_state="inactive",
+                    running_label="off",
+                    config_path=str(p),
+                    binary_path=bin_path,
+                    unit_name=p.name,
+                    pid=pid,
+                    read_only=False,
+                    can_delete=False,
+                    is_uninstalled=False,
+                    trigger_type="login",
+                    extra_meta={
+                        "desktop_id": p.name,
+                        "app_desktop_path": str(p),
+                        "icon": entry.get("icon", "").strip(),
+                    },
+                )
+            )
+
+    return items
+
+
 def collect_all_startup_data() -> BootSummary:
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_summary = pool.submit(_collect_boot_summary)
@@ -1233,6 +1426,7 @@ def collect_all_startup_data() -> BootSummary:
         items.extend(f_usr_sysd.result())
         items.extend(f_sys_sysd.result())
 
+    items.extend(_collect_desktop_app_items(procs, items))
     _enrich_packages(items)
     summary.items = items
 
@@ -1257,22 +1451,8 @@ def collect_all_startup_data() -> BootSummary:
 
 def list_installed_desktop_apps() -> list[dict[str, str]]:
     """Pure-Python scan of launchable installed packages (.desktop + pacman owner)."""
-    hides_file = OMARCHY_PATH / "default" / "omarchy" / "launcher.hides"
-    hidden_ids: set[str] = {"omastart", "io.omarchy.startup"}
-    if hides_file.is_file():
-        try:
-            for ln in hides_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-                stem = ln.strip().removesuffix(".desktop")
-                if stem:
-                    hidden_ids.add(stem)
-        except OSError:
-            pass
-
-    app_dirs = [
-        HOME / ".local" / "share" / "applications",
-        Path("/usr/local/share/applications"),
-        Path("/usr/share/applications"),
-    ]
+    hidden_ids = _load_launcher_hidden_stems()
+    app_dirs = _desktop_app_dirs()
     raw_entries: list[tuple[Path, dict[str, str]]] = []
     seen_ids: set[str] = set()
     seen_names: set[str] = set()
@@ -1297,7 +1477,8 @@ def list_installed_desktop_apps() -> list[dict[str, str]]:
             exec_raw = entry.get("exec", "").strip()
             if not name or not exec_raw:
                 continue
-            clean_cmd = re.sub(r"\s+%[fFuUdDnNickvm]\b", "", exec_raw).strip()
+            is_term = entry.get("terminal", "").lower() == "true"
+            clean_cmd = _clean_desktop_exec(exec_raw, terminal=is_term)
             if not clean_cmd or name.lower() in seen_names:
                 continue
             seen_names.add(name.lower())

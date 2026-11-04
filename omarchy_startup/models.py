@@ -12,6 +12,7 @@ class SourceKind(str, Enum):
     XDG_AUTOSTART = "xdg-autostart"
     SYSTEMD_USER = "systemd-user"
     SYSTEMD_SYSTEM = "systemd-system"
+    DESKTOP_APP = "desktop-app"
 
     @property
     def label(self) -> str:
@@ -22,6 +23,7 @@ class SourceKind(str, Enum):
             SourceKind.XDG_AUTOSTART: "XDG Autostart",
             SourceKind.SYSTEMD_USER: "Systemd · User",
             SourceKind.SYSTEMD_SYSTEM: "Systemd · System",
+            SourceKind.DESKTOP_APP: "Desktop Application",
         }[self]
 
     @property
@@ -33,6 +35,7 @@ class SourceKind(str, Enum):
             SourceKind.XDG_AUTOSTART: "xdg",
             SourceKind.SYSTEMD_USER: "user",
             SourceKind.SYSTEMD_SYSTEM: "sys",
+            SourceKind.DESKTOP_APP: "app",
         }[self]
 
     @property
@@ -43,7 +46,7 @@ class SourceKind(str, Enum):
             SourceKind.HOOK_POST_BOOT,
         ):
             return "hyprland"
-        if self == SourceKind.XDG_AUTOSTART:
+        if self in (SourceKind.XDG_AUTOSTART, SourceKind.DESKTOP_APP):
             return "xdg"
         if self == SourceKind.SYSTEMD_USER:
             return "systemd-user"
@@ -58,6 +61,7 @@ class SourceKind(str, Enum):
             SourceKind.XDG_AUTOSTART: 3,
             SourceKind.SYSTEMD_USER: 4,
             SourceKind.SYSTEMD_SYSTEM: 5,
+            SourceKind.DESKTOP_APP: 6,
         }[self]
 
 

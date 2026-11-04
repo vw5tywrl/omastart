@@ -242,7 +242,11 @@ def main() -> int:
         from omarchy_startup.collector import collect_all_startup_data
 
         summary = collect_all_startup_data()
-        items = [i for i in summary.items if (args.all or i.enabled)]
+        items = [
+            i
+            for i in summary.items
+            if i.source.value != "desktop-app" and (args.all or i.enabled)
+        ]
         if args.json:
             print(
                 json.dumps(

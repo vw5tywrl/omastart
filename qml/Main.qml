@@ -273,7 +273,7 @@ ShellRoot {
         try {
           var res = JSON.parse(String(text || "{}"))
           app.installedApps = res.apps || []
-          app.rebuildFilteredApps("")
+          app.rebuildFilteredApps(appSearchInput.text)
         } catch (e) {}
       }
     }
@@ -394,15 +394,16 @@ ShellRoot {
 
   function isItemInActiveMode(it) {
     if (currentMode === "apps") {
-      // Basic Mode: show only user autostart applications; hide internal read-only OS bootstrap scripts
+      // Basic Mode: user autostart entries + installed desktop applications
       if (it.readOnly) return false
       return (
         it.source === "hyprland-user" ||
         it.source === "xdg-autostart" ||
-        it.source === "hook-post-boot"
+        it.source === "hook-post-boot" ||
+        it.source === "desktop-app"
       )
     }
-    return true
+    return it.source !== "desktop-app"
   }
 
   function recomputeMetrics() {
@@ -416,6 +417,7 @@ ShellRoot {
     for (var i = 0; i < allItems.length; i++) {
       var it = allItems[i]
       if (!isItemInActiveMode(it)) continue
+      if (it.source === "desktop-app") continue
 
       if (it.enabled) {
         enabledCnt++
@@ -448,7 +450,8 @@ ShellRoot {
       var it = allItems[i]
       if (!isItemInActiveMode(it)) continue
       if (filterFailedOnly && it.runningState !== "failed") continue
-      if (!showDisabled && !it.enabled && !keepVisibleIds[it.id]) continue
+      var alwaysVisibleInBasic = (currentMode === "apps" && (it.source === "desktop-app" || q.length > 0))
+      if (!alwaysVisibleInBasic && !showDisabled && !it.enabled && !keepVisibleIds[it.id]) continue
       if (scopeFilter !== "all" && it.category !== scopeFilter) continue
       if (q.length > 0) {
         var hay = (
@@ -477,6 +480,7 @@ ShellRoot {
           var ta = a.bootTimeMs >= 0 ? a.bootTimeMs : -1
           var tb = b.bootTimeMs >= 0 ? b.bootTimeMs : -1
           if (tb !== ta) return tb - ta
+          if (a.enabled !== b.enabled) return a.enabled ? -1 : 1
         }
         return a.name.toLowerCase().localeCompare(b.name.toLowerCase())
       })
@@ -489,24 +493,23 @@ ShellRoot {
         rows.push({ kind: "item", item: filtered[f] })
       }
     } else if (currentMode === "apps") {
-      // Basic Mode: dead-simple layout organized by Enabled and Disabled apps
+      // Basic Mode: Enabled at Login -> Disabled (when shown) -> Available Applications
       var enabledApps = []
       var disabledApps = []
+      var availableApps = []
       for (var b = 0; b < filtered.length; b++) {
         if (filtered[b].enabled) {
           enabledApps.push(filtered[b])
+        } else if (filtered[b].source === "desktop-app") {
+          availableApps.push(filtered[b])
         } else {
           disabledApps.push(filtered[b])
         }
       }
 
-      if (sortMode === 1) {
-        enabledApps.sort(function(a, b) { return (b.bootTimeMs || 0) - (a.bootTimeMs || 0) })
-        disabledApps.sort(function(a, b) { return (b.bootTimeMs || 0) - (a.bootTimeMs || 0) })
-      } else {
-        enabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
-        disabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
-      }
+      enabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
+      disabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
+      availableApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
 
       if (enabledApps.length > 0) {
         rows.push({
@@ -519,7 +522,7 @@ ShellRoot {
         }
       }
 
-      if (disabledApps.length > 0 && (app.showDisabled || q.length > 0)) {
+      if (disabledApps.length > 0) {
         rows.push({
           kind: "header",
           title: "DISABLED  ·  " + disabledApps.length,
@@ -527,6 +530,17 @@ ShellRoot {
         })
         for (var db = 0; db < disabledApps.length; db++) {
           rows.push({ kind: "item", item: disabledApps[db] })
+        }
+      }
+
+      if (availableApps.length > 0) {
+        rows.push({
+          kind: "header",
+          title: "AVAILABLE APPLICATIONS  ·  " + availableApps.length,
+          rightMeta: "Toggle on to launch at login"
+        })
+        for (var ab = 0; ab < availableApps.length; ab++) {
+          rows.push({ kind: "item", item: availableApps[ab] })
         }
       }
     } else if (viewMode === "packages") {
@@ -1968,7 +1982,11 @@ ShellRoot {
                   textFormat: Text.PlainText
                   font.family: OmaTheme.fontFamily
                   font.pixelSize: OmaTheme.fontBody
-                  color: (rowDelegate.it && rowDelegate.it.enabled) ? OmaTheme.foreground : OmaTheme.dim
+                  color: (rowDelegate.it && rowDelegate.it.enabled)
+                    ? OmaTheme.foreground
+                    : ((rowDelegate.it && rowDelegate.it.source === "desktop-app")
+                      ? OmaTheme.rgba(OmaTheme.foreground, 0.76)
+                      : OmaTheme.dim)
                 }
 
                 // Essential tag (only on critical system/audio/display units)
@@ -3013,10 +3031,19 @@ ShellRoot {
                 maximumFlickVelocity: 4000
                 model: app.filteredApps
 
+                ScrollBar.vertical: ScrollBar {
+                  policy: ScrollBar.AsNeeded
+                  width: 4
+                  contentItem: Rectangle {
+                    implicitWidth: 4
+                    color: OmaTheme.rgba(OmaTheme.foreground, 0.22)
+                  }
+                }
+
                 delegate: Rectangle {
                   readonly property bool sel: index === app.appCursorIndex
                   readonly property bool already: app.isAppAlreadyAdded(modelData)
-                  width: appsListView.width
+                  width: appsListView.width - 8
                   height: 28
                   radius: OmaTheme.cornerRadius
                   color: sel ? OmaTheme.hoverFill : "transparent"

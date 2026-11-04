@@ -747,8 +747,11 @@ ShellRoot {
       }
 
       Column {
-        anchors.fill: parent
-        anchors.margins: 22
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: 22
+        anchors.rightMargin: 22
+        anchors.verticalCenter: parent.verticalCenter
         spacing: 16
 
         // Header
@@ -773,7 +776,7 @@ ShellRoot {
             wrapMode: Text.WordWrap
             text: "Choose what you want to manage. You can switch anytime using the header toggle or 'm'."
             font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontSmall
+            font.pixelSize: OmaTheme.fontSmall - 1
             color: OmaTheme.muted
           }
         }

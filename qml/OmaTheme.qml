@@ -45,6 +45,7 @@ QtObject {
   readonly property color selectedFill: rgba(foreground, 0.16)
   readonly property color pressedFill: rgba(foreground, 0.22)
   readonly property color accentFill: rgba(accent, 0.18)
+  readonly property color onAccent: (0.299 * accent.r + 0.587 * accent.g + 0.114 * accent.b) > 0.45 ? background : "#FFFFFF"
   readonly property color normalBorder: rgba(foreground, 0.24)
   readonly property color hoverBorder: rgba(foreground, 0.36)
   readonly property color scrim: Qt.rgba(0, 0, 0, 0.72)

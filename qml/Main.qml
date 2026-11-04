@@ -1263,11 +1263,11 @@ ShellRoot {
         anchors.fill: parent
         spacing: 0
 
-        // 1. Header Bar (minimalist flat strip, no window decorations)
+        // 1. Header Bar (minimalist flat strip, centered mode switcher)
         Item {
           id: headerBar
           width: parent.width
-          height: 44
+          height: 48
 
           Text {
             id: titleLabel
@@ -1284,13 +1284,130 @@ ShellRoot {
 
           Rectangle {
             id: headerSep
-            visible: statsLine.width >= 50
+            visible: statsLine.visible
             anchors.left: titleLabel.right
-            anchors.leftMargin: 12
+            anchors.leftMargin: 10
             anchors.verticalCenter: parent.verticalCenter
             width: 1
             height: 12
             color: OmaTheme.hairline
+          }
+
+          // Centered Prominent Mode Switcher (BASIC / ADVANCED)
+          Rectangle {
+            id: modeSwitcher
+            anchors.centerIn: parent
+            width: 212
+            height: 30
+            radius: OmaTheme.cornerRadius
+            color: OmaTheme.elevated
+            border.width: 1
+            border.color: OmaTheme.rgba(OmaTheme.accent, 0.55)
+
+            // Sliding solid-accent active pill
+            Rectangle {
+              id: activeModePill
+              y: 3
+              x: app.currentMode === "apps" ? 3 : (parent.width / 2 + 1)
+              width: parent.width / 2 - 4
+              height: parent.height - 6
+              radius: Math.max(0, OmaTheme.cornerRadius - 2)
+              color: OmaTheme.accent
+
+              Behavior on x {
+                NumberAnimation { duration: 140; easing.type: Easing.OutCubic }
+              }
+            }
+
+            // BASIC segment
+            Item {
+              x: 0
+              y: 0
+              width: parent.width / 2
+              height: parent.height
+
+              Rectangle {
+                visible: basicSegMouse.containsMouse && app.currentMode !== "apps"
+                anchors.fill: parent
+                anchors.margins: 3
+                anchors.rightMargin: 1
+                radius: Math.max(0, OmaTheme.cornerRadius - 2)
+                color: OmaTheme.hoverFill
+              }
+
+              Text {
+                anchors.centerIn: parent
+                text: "BASIC"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSmall
+                font.bold: true
+                font.letterSpacing: 1.3
+                color: app.currentMode === "apps"
+                  ? OmaTheme.onAccent
+                  : (basicSegMouse.containsMouse ? OmaTheme.foreground : OmaTheme.muted)
+              }
+
+              MouseArea {
+                id: basicSegMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: app.statusMessage = "Basic mode: desktop startup applications (shortcut: m)"
+                onExited: app.statusMessage = ""
+                onClicked: {
+                  if (app.currentMode !== "apps") {
+                    app.currentMode = "apps"
+                    app.recomputeMetrics()
+                    app.rebuildRows()
+                  }
+                }
+              }
+            }
+
+            // ADVANCED segment
+            Item {
+              x: parent.width / 2
+              y: 0
+              width: parent.width / 2
+              height: parent.height
+
+              Rectangle {
+                visible: advSegMouse.containsMouse && app.currentMode !== "system"
+                anchors.fill: parent
+                anchors.margins: 3
+                anchors.leftMargin: 1
+                radius: Math.max(0, OmaTheme.cornerRadius - 2)
+                color: OmaTheme.hoverFill
+              }
+
+              Text {
+                anchors.centerIn: parent
+                text: "ADVANCED"
+                font.family: OmaTheme.fontFamily
+                font.pixelSize: OmaTheme.fontSmall
+                font.bold: true
+                font.letterSpacing: 1.3
+                color: app.currentMode === "system"
+                  ? OmaTheme.onAccent
+                  : (advSegMouse.containsMouse ? OmaTheme.foreground : OmaTheme.muted)
+              }
+
+              MouseArea {
+                id: advSegMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onEntered: app.statusMessage = "Advanced mode: full systemd daemons, timers & diagnostics (shortcut: m)"
+                onExited: app.statusMessage = ""
+                onClicked: {
+                  if (app.currentMode !== "system") {
+                    app.currentMode = "system"
+                    app.recomputeMetrics()
+                    app.rebuildRows()
+                  }
+                }
+              }
+            }
           }
 
           Row {
@@ -1311,57 +1428,6 @@ ShellRoot {
               }
             }
 
-            // Mode switcher: BASIC vs ADVANCED
-            Row {
-              spacing: 0
-              OmaButton {
-                text: "BASIC"
-                active: app.currentMode === "apps"
-                onClicked: {
-                  app.currentMode = "apps"
-                  app.recomputeMetrics()
-                  app.rebuildRows()
-                }
-              }
-              OmaButton {
-                text: "ADVANCED"
-                active: app.currentMode === "system"
-                onClicked: {
-                  app.currentMode = "system"
-                  app.recomputeMetrics()
-                  app.rebuildRows()
-                }
-              }
-            }
-
-            // View modes in System mode
-            Row {
-              spacing: 0
-              visible: app.currentMode === "system"
-              OmaButton {
-                text: "PACKAGES"
-                active: app.viewMode === "packages" && !app.filterFailedOnly
-                onClicked: { app.filterFailedOnly = false; app.viewMode = "packages"; app.rebuildRows() }
-              }
-              OmaButton {
-                text: "LAYERS"
-                active: app.viewMode === "layers" && !app.filterFailedOnly
-                onClicked: { app.filterFailedOnly = false; app.viewMode = "layers"; app.rebuildRows() }
-              }
-            }
-
-            OmaButton {
-              text: app.currentMode === "apps"
-                ? ("DISABLED" + (app.countDisabled > 0 ? " (" + app.countDisabled + ")" : ""))
-                : "DISABLED"
-              active: app.showDisabled
-              onClicked: {
-                app.showDisabled = !app.showDisabled
-                app.recomputeMetrics()
-                app.rebuildRows()
-              }
-            }
-
             OmaButton {
               text: "+ ADD"
               accentStyle: true
@@ -1372,26 +1438,28 @@ ShellRoot {
           Text {
             id: statsLine
             anchors.left: headerSep.right
-            anchors.leftMargin: 12
-            anchors.right: rightHeaderRow.left
-            anchors.rightMargin: 14
+            anchors.leftMargin: 10
+            anchors.right: modeSwitcher.left
+            anchors.rightMargin: 10
             anchors.verticalCenter: parent.verticalCenter
-            visible: width >= 50
+            visible: width >= 74
             elide: Text.ElideRight
             textFormat: Text.PlainText
             text: {
               if (app.loading) return "scanning..."
               if (app.currentMode === "apps") {
-                return app.countEnabled + " apps launch at login"
+                if (width >= 150) {
+                  return app.countEnabled + (app.countEnabled === 1 ? " app at login" : " apps at login")
+                }
+                return app.countEnabled + " enabled"
               }
-              if (width >= 320) {
-                return app.countEnabled + " enabled  ·  " + app.countPackages + " pkgs  ·  " +
-                       app.countRunning + " active  ·  boot " + app.bootUserspace
-              }
-              if (width >= 215) {
+              if (width >= 300) {
                 return app.countEnabled + " enabled  ·  " + app.countPackages + " pkgs  ·  boot " + app.bootUserspace
               }
-              return app.countEnabled + " enabled  ·  " + app.countPackages + " pkgs"
+              if (width >= 185) {
+                return app.countEnabled + " enabled  ·  boot " + app.bootUserspace
+              }
+              return app.countEnabled + " enabled"
             }
             font.family: OmaTheme.fontFamily
             font.pixelSize: OmaTheme.fontSmall
@@ -1411,7 +1479,7 @@ ShellRoot {
 
         Rectangle { width: parent.width; height: 1; color: OmaTheme.hairline }
 
-        // 2. Filter Input + Sort + Scope Strip + Responsive Status Legend
+        // 2. Filter Input + View/Sort Controls + Scope Strip + Responsive Status Legend
         Item {
           id: filterBar
           width: parent.width
@@ -1433,7 +1501,7 @@ ShellRoot {
             anchors.topMargin: 8
             spacing: filterBar.wrapLegend ? 6 : 8
 
-            // Search + Sort row
+            // Search + View/Filter/Sort row
             Item {
               width: parent.width
               height: 26
@@ -1441,7 +1509,7 @@ ShellRoot {
               Rectangle {
                 id: searchBox
                 anchors.left: parent.left
-                anchors.right: sortBtn.left
+                anchors.right: filterControlsRow.left
                 anchors.rightMargin: 8
                 height: 26
                 radius: OmaTheme.cornerRadius
@@ -1482,8 +1550,11 @@ ShellRoot {
                   Text {
                     anchors.fill: parent
                     verticalAlignment: Text.AlignVCenter
+                    elide: Text.ElideRight
                     visible: filterInput.text.length === 0 && !filterInput.activeFocus
-                    text: app.currentMode === "apps" ? "Search startup applications..." : "Filter packages, units, binaries..."
+                    text: app.currentMode === "apps"
+                      ? "Search startup applications..."
+                      : (searchBox.width >= 280 ? "Filter packages, units, binaries..." : "Filter startup units...")
                     font.family: OmaTheme.fontFamily
                     font.pixelSize: OmaTheme.fontSmall
                     color: OmaTheme.faint
@@ -1511,15 +1582,56 @@ ShellRoot {
                 }
               }
 
-              OmaButton {
-                id: sortBtn
+              Row {
+                id: filterControlsRow
                 anchors.right: parent.right
                 height: 26
-                text: "SORT: " + app.sortLabels[app.sortMode]
-                active: app.sortMode !== 0
-                onClicked: {
-                  app.sortMode = (app.sortMode + 1) % 3
-                  app.rebuildRows()
+                spacing: 6
+
+                // View modes in Advanced mode (PACKAGES vs LAYERS)
+                Row {
+                  spacing: 0
+                  visible: app.currentMode === "system"
+                  OmaButton {
+                    height: 26
+                    hPad: 9
+                    text: "PACKAGES"
+                    active: app.viewMode === "packages" && !app.filterFailedOnly
+                    onClicked: { app.filterFailedOnly = false; app.viewMode = "packages"; app.rebuildRows() }
+                  }
+                  OmaButton {
+                    height: 26
+                    hPad: 9
+                    text: "LAYERS"
+                    active: app.viewMode === "layers" && !app.filterFailedOnly
+                    onClicked: { app.filterFailedOnly = false; app.viewMode = "layers"; app.rebuildRows() }
+                  }
+                }
+
+                OmaButton {
+                  height: 26
+                  hPad: 9
+                  text: app.currentMode === "apps"
+                    ? ("DISABLED" + (app.countDisabled > 0 ? " (" + app.countDisabled + ")" : ""))
+                    : "DISABLED"
+                  active: app.showDisabled
+                  onClicked: {
+                    app.showDisabled = !app.showDisabled
+                    app.recomputeMetrics()
+                    app.rebuildRows()
+                  }
+                }
+
+                OmaButton {
+                  id: sortBtn
+                  height: 26
+                  hPad: 9
+                  text: "SORT: " + app.sortLabels[app.sortMode]
+                  active: app.sortMode !== 0
+                  onClicked: {
+                    app.sortMode = (app.sortMode + 1) % 3
+                    app.rebuildRows()
+                  }
                 }
               }
             }

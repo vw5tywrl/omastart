@@ -1688,7 +1688,24 @@ ShellRoot {
             bottomMargin: 10
             clip: true
             boundsBehavior: Flickable.StopAtBounds
+            flickableDirection: Flickable.VerticalFlick
+            pixelAligned: true
+            cacheBuffer: 800
+            reuseItems: true
+            flickDeceleration: 3000
+            maximumFlickVelocity: 4000
             model: app.visibleRows
+
+            property bool isScrolling: moving || flicking
+            Timer {
+              id: scrollIdleTimer
+              interval: 120
+              onTriggered: listView.isScrolling = false
+            }
+            onContentYChanged: {
+              listView.isScrolling = true
+              scrollIdleTimer.restart()
+            }
 
             ScrollBar.vertical: ScrollBar {
               policy: ScrollBar.AsNeeded
@@ -1699,12 +1716,304 @@ ShellRoot {
               }
             }
 
-            delegate: Loader {
-              id: rowLoader
+            delegate: Item {
+              id: rowDelegate
               width: listView.width - 8
+              height: 30
+
               readonly property var rowObj: modelData
               readonly property int rowIdx: index
-              sourceComponent: rowObj.kind === "header" ? sectionHeaderComp : itemRowComp
+              readonly property bool isHeader: Boolean(rowObj && rowObj.kind === "header")
+              readonly property var it: (!isHeader && rowObj && rowObj.item) ? rowObj.item : null
+              readonly property bool hasCursor: !isHeader && app.cursorActive && app.cursorRowIndex === rowIdx
+
+              // Header subview
+              Item {
+                id: secHeaderItem
+                anchors.fill: parent
+                visible: rowDelegate.isHeader
+
+                Rectangle {
+                  visible: rowDelegate.rowIdx > 0
+                  anchors.top: parent.top
+                  anchors.topMargin: 4
+                  width: parent.width
+                  height: 1
+                  color: OmaTheme.rgba(OmaTheme.foreground, 0.07)
+                }
+
+                Text {
+                  id: secLeft
+                  anchors.left: parent.left
+                  anchors.bottom: parent.bottom
+                  anchors.bottomMargin: 4
+                  text: rowDelegate.isHeader ? (rowDelegate.rowObj.title || "") : ""
+                  textFormat: Text.PlainText
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontCaption
+                  font.bold: true
+                  font.letterSpacing: 1.1
+                  color: OmaTheme.muted
+                }
+
+                Text {
+                  anchors.left: secLeft.right
+                  anchors.leftMargin: 12
+                  anchors.right: parent.right
+                  anchors.bottom: parent.bottom
+                  anchors.bottomMargin: 4
+                  horizontalAlignment: Text.AlignRight
+                  elide: Text.ElideRight
+                  text: (rowDelegate.isHeader && rowDelegate.rowObj.rightMeta) ? rowDelegate.rowObj.rightMeta : ""
+                  textFormat: Text.PlainText
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontCaption
+                  color: OmaTheme.faint
+                }
+              }
+
+              // Normal Item Row subview
+              Rectangle {
+                id: itemRect
+                anchors.fill: parent
+                visible: !rowDelegate.isHeader
+                radius: OmaTheme.cornerRadius
+                color: rowDelegate.hasCursor ? OmaTheme.hoverFill : "transparent"
+
+                // Crisp 2px accent indicator on active cursor row
+                Rectangle {
+                  visible: rowDelegate.hasCursor
+                  anchors.left: parent.left
+                  anchors.top: parent.top
+                  anchors.bottom: parent.bottom
+                  width: 2
+                  color: OmaTheme.accent
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  anchors.rightMargin: 44
+                  hoverEnabled: !listView.isScrolling
+                  cursorShape: Qt.PointingHandCursor
+                  onEntered: {
+                    if (rowDelegate.it && !listView.isScrolling) {
+                      app.cursorActive = true
+                      app.cursorRowIndex = rowDelegate.rowIdx
+                      app.cursorItemId = rowDelegate.it.id
+                    }
+                  }
+                  onPositionChanged: {
+                    if (rowDelegate.it && !listView.isScrolling && (!app.cursorActive || app.cursorRowIndex !== rowDelegate.rowIdx)) {
+                      app.cursorActive = true
+                      app.cursorRowIndex = rowDelegate.rowIdx
+                      app.cursorItemId = rowDelegate.it.id
+                    }
+                  }
+                  onClicked: {
+                    if (rowDelegate.it) {
+                      app.cursorItemId = rowDelegate.it.id
+                      app.openInspector(rowDelegate.it)
+                    }
+                  }
+                }
+
+                // Status dot
+                Text {
+                  id: statusDot
+                  anchors.left: parent.left
+                  anchors.leftMargin: 8
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: 14
+                  text: {
+                    if (!rowDelegate.it || !rowDelegate.it.enabled) return "○"
+                    if (rowDelegate.it.runningState === "running") return "●"
+                    if (rowDelegate.it.runningState === "failed") return "×"
+                    return "·"
+                  }
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontBody
+                  font.bold: true
+                  color: {
+                    if (!rowDelegate.it || !rowDelegate.it.enabled) return OmaTheme.faint
+                    if (rowDelegate.it.runningState === "running") return OmaTheme.green
+                    if (rowDelegate.it.runningState === "failed") return OmaTheme.red
+                    return OmaTheme.muted
+                  }
+                }
+
+                // Program / unit name
+                Text {
+                  id: nameText
+                  anchors.left: statusDot.right
+                  anchors.leftMargin: 4
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.min(implicitWidth, Math.max(110, itemRect.width * 0.30))
+                  elide: Text.ElideRight
+                  text: rowDelegate.it ? (rowDelegate.it.name || "") : ""
+                  textFormat: Text.PlainText
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontBody
+                  color: (rowDelegate.it && rowDelegate.it.enabled) ? OmaTheme.foreground : OmaTheme.dim
+                }
+
+                // Essential tag (only on critical system/audio/display units)
+                Text {
+                  id: critTag
+                  visible: Boolean(rowDelegate.it && rowDelegate.it.isCritical)
+                  anchors.left: nameText.right
+                  anchors.leftMargin: 8
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: "essential"
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontCaption
+                  color: OmaTheme.red
+                }
+
+                // Uninstalled tag (when binary was deleted/uninstalled but config entry remains)
+                Item {
+                  id: uninstalledSlot
+                  visible: Boolean(rowDelegate.it && rowDelegate.it.isUninstalled)
+                  anchors.left: (rowDelegate.it && rowDelegate.it.isCritical) ? critTag.right : nameText.right
+                  anchors.leftMargin: 8
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: uninstalledTxt.implicitWidth + 8
+                  height: 16
+
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: OmaTheme.cornerRadius
+                    color: OmaTheme.rgba(OmaTheme.yellow, 0.15)
+                    border.width: 1
+                    border.color: OmaTheme.rgba(OmaTheme.yellow, 0.40)
+                  }
+
+                  Text {
+                    id: uninstalledTxt
+                    anchors.centerIn: parent
+                    text: "UNINSTALLED"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    font.bold: true
+                    color: OmaTheme.yellow
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: !listView.isScrolling
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: if (!listView.isScrolling) app.statusMessage = "Your package has been uninstalled, but the .config has not been updated with the uninstallation."
+                    onExited: app.statusMessage = ""
+                    onClicked: {
+                      if (rowDelegate.it) {
+                        app.cursorItemId = rowDelegate.it.id
+                        app.openInspector(rowDelegate.it)
+                      }
+                    }
+                  }
+                }
+
+                // Middle subtle description / command
+                Text {
+                  anchors.left: (rowDelegate.it && rowDelegate.it.isUninstalled)
+                    ? uninstalledSlot.right
+                    : ((rowDelegate.it && rowDelegate.it.isCritical) ? critTag.right : nameText.right)
+                  anchors.leftMargin: 12
+                  anchors.right: bootCol.left
+                  anchors.rightMargin: 12
+                  anchors.verticalCenter: parent.verticalCenter
+                  visible: width > 40
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: rowDelegate.it ? (rowDelegate.it.description || rowDelegate.it.command || "") : ""
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSmall
+                  color: OmaTheme.faint
+                }
+
+                // Right columns: Boot Time | Tag (source or pkg) | State | Toggle/Core
+                Text {
+                  id: bootCol
+                  anchors.right: tagCol.left
+                  anchors.rightMargin: 12
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: (app.currentMode === "system" && itemRect.width >= 620) ? 58 : 0
+                  visible: width > 0
+                  horizontalAlignment: Text.AlignRight
+                  text: rowDelegate.it ? (rowDelegate.it.bootTimeText || "") : ""
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontSmall
+                  color: (rowDelegate.it && rowDelegate.it.bootTimeMs >= 1000) ? OmaTheme.yellow : OmaTheme.muted
+                }
+
+                Text {
+                  id: tagCol
+                  anchors.right: stateCol.left
+                  anchors.rightMargin: 12
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: app.viewMode === "layers" ? 110 : (app.currentMode === "apps" ? 0 : 42)
+                  visible: width > 0
+                  horizontalAlignment: Text.AlignRight
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: {
+                    if (!rowDelegate.it) return ""
+                    return app.viewMode === "layers"
+                      ? (rowDelegate.it.pkgName || rowDelegate.it.pkgKey || "")
+                      : (rowDelegate.it.sourceTag || "")
+                  }
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontCaption
+                  color: app.viewMode === "layers" ? OmaTheme.cyan : OmaTheme.blue
+                }
+
+                Text {
+                  id: stateCol
+                  anchors.right: ctrlSlot.left
+                  anchors.rightMargin: 12
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: itemRect.width >= 540 ? 104 : 0
+                  visible: width > 0
+                  horizontalAlignment: Text.AlignRight
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: rowDelegate.it ? (rowDelegate.it.runningLabel || "") : ""
+                  font.family: OmaTheme.fontFamily
+                  font.pixelSize: OmaTheme.fontCaption
+                  color: {
+                    if (!rowDelegate.it) return OmaTheme.dim
+                    if (rowDelegate.it.runningState === "running") return OmaTheme.green
+                    if (rowDelegate.it.runningState === "failed") return OmaTheme.red
+                    return OmaTheme.dim
+                  }
+                }
+
+                Item {
+                  id: ctrlSlot
+                  anchors.right: parent.right
+                  anchors.rightMargin: 4
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: 36
+                  height: 20
+
+                  Text {
+                    visible: Boolean(rowDelegate.it && rowDelegate.it.readOnly)
+                    anchors.centerIn: parent
+                    text: "core"
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontCaption
+                    color: OmaTheme.dim
+                  }
+
+                  OmaSwitch {
+                    visible: Boolean(rowDelegate.it && !rowDelegate.it.readOnly)
+                    anchors.centerIn: parent
+                    checked: Boolean(rowDelegate.it && rowDelegate.it.enabled)
+                    busy: app.busyAction
+                    hoverable: !listView.isScrolling
+                    onToggled: if (rowDelegate.it) app.requestToggle(rowDelegate.it)
+                  }
+                }
+              }
             }
           }
         }
@@ -1757,287 +2066,7 @@ ShellRoot {
         }
       }
 
-      // ---- Delegate Components ----------------------------------------------
-      Component {
-        id: sectionHeaderComp
-        Item {
-          width: parent ? parent.width : 0
-          height: rowIdx === 0 ? 26 : 34
 
-          Rectangle {
-            visible: rowIdx > 0
-            anchors.top: parent.top
-            anchors.topMargin: 8
-            width: parent.width
-            height: 1
-            color: OmaTheme.rgba(OmaTheme.foreground, 0.07)
-          }
-
-          Text {
-            id: secLeft
-            anchors.left: parent.left
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: 4
-            text: rowObj.title
-            textFormat: Text.PlainText
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontCaption
-            font.bold: true
-            font.letterSpacing: 1.1
-            color: OmaTheme.muted
-          }
-
-          Text {
-            anchors.left: secLeft.right
-            anchors.leftMargin: 12
-            anchors.right: parent.right
-            anchors.bottom: parent.bottom
-            anchors.bottomMargin: 4
-            horizontalAlignment: Text.AlignRight
-            elide: Text.ElideRight
-            text: rowObj.rightMeta || ""
-            textFormat: Text.PlainText
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontCaption
-            color: OmaTheme.faint
-          }
-        }
-      }
-
-      Component {
-        id: itemRowComp
-        Rectangle {
-          id: itemRect
-          readonly property var it: rowObj.item
-          readonly property bool hasCursor: app.cursorActive && app.cursorRowIndex === rowIdx
-
-          width: parent ? parent.width : 0
-          height: 30
-          radius: OmaTheme.cornerRadius
-          color: hasCursor ? OmaTheme.hoverFill : "transparent"
-
-          // Crisp 2px accent indicator on active cursor row
-          Rectangle {
-            visible: itemRect.hasCursor
-            anchors.left: parent.left
-            anchors.top: parent.top
-            anchors.bottom: parent.bottom
-            width: 2
-            color: OmaTheme.accent
-          }
-
-          MouseArea {
-            anchors.fill: parent
-            anchors.rightMargin: 44
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onEntered: {
-              app.cursorActive = true
-              app.cursorRowIndex = rowIdx
-              app.cursorItemId = itemRect.it.id
-            }
-            onPositionChanged: {
-              if (!app.cursorActive || app.cursorRowIndex !== rowIdx) {
-                app.cursorActive = true
-                app.cursorRowIndex = rowIdx
-                app.cursorItemId = itemRect.it.id
-              }
-            }
-            onClicked: {
-              app.cursorItemId = itemRect.it.id
-              app.openInspector(itemRect.it)
-            }
-          }
-
-          // Status dot
-          Text {
-            id: statusDot
-            anchors.left: parent.left
-            anchors.leftMargin: 8
-            anchors.verticalCenter: parent.verticalCenter
-            width: 14
-            text: {
-              if (!itemRect.it.enabled) return "○"
-              if (itemRect.it.runningState === "running") return "●"
-              if (itemRect.it.runningState === "failed") return "×"
-              return "·"
-            }
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontBody
-            font.bold: true
-            color: {
-              if (!itemRect.it.enabled) return OmaTheme.faint
-              if (itemRect.it.runningState === "running") return OmaTheme.green
-              if (itemRect.it.runningState === "failed") return OmaTheme.red
-              return OmaTheme.muted
-            }
-          }
-
-          // Program / unit name
-          Text {
-            id: nameText
-            anchors.left: statusDot.right
-            anchors.leftMargin: 4
-            anchors.verticalCenter: parent.verticalCenter
-            width: Math.min(implicitWidth, Math.max(110, itemRect.width * 0.30))
-            elide: Text.ElideRight
-            text: itemRect.it.name
-            textFormat: Text.PlainText
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontBody
-            color: itemRect.it.enabled ? OmaTheme.foreground : OmaTheme.dim
-          }
-
-          // Essential tag (only on critical system/audio/display units)
-          Text {
-            id: critTag
-            visible: itemRect.it.isCritical
-            anchors.left: nameText.right
-            anchors.leftMargin: 8
-            anchors.verticalCenter: parent.verticalCenter
-            text: "essential"
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontCaption
-            color: OmaTheme.red
-          }
-
-          // Uninstalled tag (when binary was deleted/uninstalled but config entry remains)
-          Item {
-            id: uninstalledSlot
-            visible: itemRect.it.isUninstalled
-            anchors.left: itemRect.it.isCritical ? critTag.right : nameText.right
-            anchors.leftMargin: 8
-            anchors.verticalCenter: parent.verticalCenter
-            width: uninstalledTxt.implicitWidth + 8
-            height: 16
-
-            Rectangle {
-              anchors.fill: parent
-              radius: OmaTheme.cornerRadius
-              color: OmaTheme.rgba(OmaTheme.yellow, 0.15)
-              border.width: 1
-              border.color: OmaTheme.rgba(OmaTheme.yellow, 0.40)
-            }
-
-            Text {
-              id: uninstalledTxt
-              anchors.centerIn: parent
-              text: "UNINSTALLED"
-              font.family: OmaTheme.fontFamily
-              font.pixelSize: OmaTheme.fontCaption
-              font.bold: true
-              color: OmaTheme.yellow
-            }
-
-            MouseArea {
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onEntered: app.statusMessage = "Your package has been uninstalled, but the .config has not been updated with the uninstallation."
-              onExited: app.statusMessage = ""
-              onClicked: {
-                app.cursorItemId = itemRect.it.id
-                app.openInspector(itemRect.it)
-              }
-            }
-          }
-
-          // Middle subtle description / command
-          Text {
-            anchors.left: itemRect.it.isUninstalled ? uninstalledSlot.right : (itemRect.it.isCritical ? critTag.right : nameText.right)
-            anchors.leftMargin: 12
-            anchors.right: bootCol.left
-            anchors.rightMargin: 12
-            anchors.verticalCenter: parent.verticalCenter
-            visible: width > 40
-            elide: Text.ElideRight
-            textFormat: Text.PlainText
-            text: itemRect.it.description || itemRect.it.command
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontSmall
-            color: OmaTheme.faint
-          }
-
-          // Right columns: Boot Time | Tag (source or pkg) | State | Toggle/Core
-          Text {
-            id: bootCol
-            anchors.right: tagCol.left
-            anchors.rightMargin: 12
-            anchors.verticalCenter: parent.verticalCenter
-            width: (app.currentMode === "system" && itemRect.width >= 620) ? 58 : 0
-            visible: width > 0
-            horizontalAlignment: Text.AlignRight
-            text: itemRect.it.bootTimeText
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontSmall
-            color: itemRect.it.bootTimeMs >= 1000 ? OmaTheme.yellow : OmaTheme.muted
-          }
-
-          Text {
-            id: tagCol
-            anchors.right: stateCol.left
-            anchors.rightMargin: 12
-            anchors.verticalCenter: parent.verticalCenter
-            width: app.viewMode === "layers" ? 110 : (app.currentMode === "apps" ? 0 : 42)
-            visible: width > 0
-            horizontalAlignment: Text.AlignRight
-            elide: Text.ElideRight
-            textFormat: Text.PlainText
-            text: app.viewMode === "layers"
-              ? (itemRect.it.pkgName || itemRect.it.pkgKey)
-              : itemRect.it.sourceTag
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontCaption
-            color: app.viewMode === "layers" ? OmaTheme.cyan : OmaTheme.blue
-          }
-
-          Text {
-            id: stateCol
-            anchors.right: ctrlSlot.left
-            anchors.rightMargin: 12
-            anchors.verticalCenter: parent.verticalCenter
-            width: itemRect.width >= 540 ? 104 : 0
-            visible: width > 0
-            horizontalAlignment: Text.AlignRight
-            elide: Text.ElideRight
-            textFormat: Text.PlainText
-            text: itemRect.it.runningLabel
-            font.family: OmaTheme.fontFamily
-            font.pixelSize: OmaTheme.fontCaption
-            color: {
-              if (itemRect.it.runningState === "running") return OmaTheme.green
-              if (itemRect.it.runningState === "failed") return OmaTheme.red
-              return OmaTheme.dim
-            }
-          }
-
-          Item {
-            id: ctrlSlot
-            anchors.right: parent.right
-            anchors.rightMargin: 4
-            anchors.verticalCenter: parent.verticalCenter
-            width: 36
-            height: 20
-
-            Text {
-              visible: itemRect.it.readOnly
-              anchors.centerIn: parent
-              text: "core"
-              font.family: OmaTheme.fontFamily
-              font.pixelSize: OmaTheme.fontCaption
-              color: OmaTheme.dim
-            }
-
-            OmaSwitch {
-              visible: !itemRect.it.readOnly
-              anchors.centerIn: parent
-              checked: itemRect.it.enabled
-              busy: app.busyAction
-              onToggled: app.requestToggle(itemRect.it)
-            }
-          }
-        }
-      }
 
       // ======================================================================
       // MODAL 1: Inspector Card
@@ -2530,6 +2559,12 @@ ShellRoot {
                 height: parent.height - 24
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                pixelAligned: true
+                cacheBuffer: 400
+                reuseItems: true
+                flickDeceleration: 3000
+                maximumFlickVelocity: 4000
                 model: app.criticalChain
 
                 ScrollBar.vertical: ScrollBar {
@@ -2636,6 +2671,12 @@ ShellRoot {
                 height: parent.height - 24
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                pixelAligned: true
+                cacheBuffer: 400
+                reuseItems: true
+                flickDeceleration: 3000
+                maximumFlickVelocity: 4000
                 model: app.slowestUnits
 
                 ScrollBar.vertical: ScrollBar {
@@ -2849,6 +2890,12 @@ ShellRoot {
                 height: parent.height - 34
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
+                flickableDirection: Flickable.VerticalFlick
+                pixelAligned: true
+                cacheBuffer: 400
+                reuseItems: true
+                flickDeceleration: 3000
+                maximumFlickVelocity: 4000
                 model: app.filteredApps
 
                 delegate: Rectangle {
@@ -2910,9 +2957,13 @@ ShellRoot {
 
                   MouseArea {
                     anchors.fill: parent
-                    hoverEnabled: true
+                    hoverEnabled: !appsListView.moving && !appsListView.flicking
                     cursorShape: Qt.PointingHandCursor
-                    onEntered: app.appCursorIndex = index
+                    onEntered: {
+                      if (!appsListView.moving && !appsListView.flicking) {
+                        app.appCursorIndex = index
+                      }
+                    }
                     onClicked: {
                       if (app.isAppAlreadyAdded(modelData)) {
                         app.toast(modelData.name + " is already in startup")

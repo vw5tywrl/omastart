@@ -6,6 +6,7 @@ Item {
 
   property bool checked: false
   property bool busy: false
+  property bool hoverable: true
   property int trackWidth: 32
   property int trackHeight: 16
   readonly property int knobSize: 10
@@ -22,12 +23,12 @@ Item {
     anchors.fill: parent
     radius: OmaTheme.cornerRadius > 0 ? height / 2 : 0
     color: root.checked
-      ? (mouse.containsMouse ? OmaTheme.rgba(OmaTheme.accent, 0.28) : OmaTheme.accentFill)
-      : (mouse.containsMouse ? OmaTheme.hoverFill : OmaTheme.normalFill)
+      ? (mouse.containsMouse && root.hoverable ? OmaTheme.rgba(OmaTheme.accent, 0.28) : OmaTheme.accentFill)
+      : (mouse.containsMouse && root.hoverable ? OmaTheme.hoverFill : OmaTheme.normalFill)
     border.width: 1
     border.color: root.checked
       ? OmaTheme.rgba(OmaTheme.accent, 0.85)
-      : (mouse.containsMouse ? OmaTheme.hoverBorder : OmaTheme.normalBorder)
+      : (mouse.containsMouse && root.hoverable ? OmaTheme.hoverBorder : OmaTheme.normalBorder)
 
     Behavior on color { ColorAnimation { duration: 110 } }
 
@@ -47,7 +48,7 @@ Item {
   MouseArea {
     id: mouse
     anchors.fill: parent
-    hoverEnabled: true
+    hoverEnabled: root.hoverable
     cursorShape: Qt.PointingHandCursor
     onClicked: {
       if (!root.busy) root.toggled()

@@ -127,6 +127,9 @@ ShellRoot {
   }
 
   // ---- Backend Processes ----------------------------------------------------
+  property bool pendingRescan: false
+  property var actionQueue: []
+
   Process {
     id: scanProc
     command: [app.backendBin, "--backend", "scan"]
@@ -148,6 +151,10 @@ ShellRoot {
           app.rebuildRows()
         } catch (e) {
           app.toast("Failed to parse startup state")
+        }
+        if (app.pendingRescan) {
+          app.pendingRescan = false
+          app.reloadScan()
         }
       }
     }
@@ -223,9 +230,12 @@ ShellRoot {
   Process {
     id: actionProc
     property var argsList: []
+    property string currentSubcmd: ""
+    property string currentToggleSource: ""
     command: argsList
     onExited: function(exitCode, exitStatus) {
       app.busyAction = false
+      app.pumpActionQueue()
     }
     stdout: StdioCollector {
       waitForEnd: true
@@ -237,10 +247,28 @@ ShellRoot {
           if (res.ok) {
             if (res.closeInspector) app.inspectedItem = null
             if (res.closeAdd) app.addModalOpen = false
+            var fastLocalToggle = (
+              actionProc.currentSubcmd === "toggle" &&
+              (actionProc.currentToggleSource === "desktop-app" ||
+               actionProc.currentToggleSource === "xdg-autostart" ||
+               actionProc.currentToggleSource === "hook-post-boot" ||
+               actionProc.currentToggleSource === "hyprland-user")
+            )
+            var noScanCmd = (
+              actionProc.currentSubcmd === "settings-set" ||
+              actionProc.currentSubcmd === "open-dir" ||
+              actionProc.currentSubcmd === "open-editor" ||
+              actionProc.currentSubcmd === "snapshot-save"
+            )
+            if (!fastLocalToggle && !noScanCmd) {
+              app.reloadScan()
+            }
+          } else if (actionProc.currentSubcmd === "toggle") {
             app.reloadScan()
           }
         } catch (e) {
           app.toast("Action failed")
+          if (actionProc.currentSubcmd === "toggle") app.reloadScan()
         }
       }
     }
@@ -280,16 +308,90 @@ ShellRoot {
   }
 
   function reloadScan() {
-    if (scanProc.running) return
+    if (scanProc.running) {
+      pendingRescan = true
+      return
+    }
+    pendingRescan = false
     loading = true
     scanProc.running = true
   }
 
-  function runBackendAction(subcmd, objPayload) {
-    if (actionProc.running) return
+  function applyOptimisticToggle(itemId, nextState) {
+    if (!itemId) return
+    var nextItems = []
+    var changed = false
+    for (var i = 0; i < allItems.length; i++) {
+      var it = allItems[i]
+      if (it.id !== itemId) {
+        nextItems.push(it)
+        continue
+      }
+      var updated = Object.assign({}, it)
+      var em = Object.assign({}, updated.extraMeta || {})
+      updated.enabled = nextState
+      if (updated.source === "desktop-app" && nextState) {
+        updated.source = "xdg-autostart"
+        updated.sourceLabel = "XDG Autostart"
+        updated.sourceTag = "xdg"
+        updated.runningState = updated.pid > 0 ? "running" : "inactive"
+        updated.runningLabel = updated.pid > 0 ? "active" : "on login"
+        em.omastart_managed = "1"
+        em.has_usr = "1"
+        updated.canDelete = true
+      } else if (
+        updated.source === "xdg-autostart" &&
+        !nextState &&
+        em.omastart_managed === "1" &&
+        em.has_sys !== "1" &&
+        em.app_desktop_path
+      ) {
+        updated.source = "desktop-app"
+        updated.sourceLabel = "Desktop Application"
+        updated.sourceTag = "app"
+        updated.runningState = "inactive"
+        updated.runningLabel = "off"
+        updated.canDelete = false
+      } else {
+        updated.isMasked = false
+        updated.runningState = nextState ? (updated.pid > 0 ? "running" : "oneshot_done") : "inactive"
+        updated.runningLabel = nextState ? (updated.pid > 0 ? "active" : "done") : "disabled"
+      }
+      updated.extraMeta = em
+      nextItems.push(updated)
+      if (inspectedItem && inspectedItem.id === itemId) {
+        inspectedItem = updated
+      }
+      changed = true
+    }
+    if (changed) {
+      allItems = nextItems
+      recomputeMetrics()
+      rebuildRows()
+    }
+  }
+
+  function pumpActionQueue() {
+    if (actionProc.running || actionQueue.length === 0) return
+    var next = actionQueue[0]
+    actionQueue = actionQueue.slice(1)
     busyAction = true
-    actionProc.argsList = [app.backendBin, "--backend", subcmd, JSON.stringify(objPayload)]
+    actionProc.currentSubcmd = next.subcmd
+    actionProc.currentToggleSource = next.toggleSource
+    actionProc.argsList = [app.backendBin, "--backend", next.subcmd, next.payloadStr]
     actionProc.running = true
+  }
+
+  function runBackendAction(subcmd, objPayload) {
+    var payloadStr = JSON.stringify(objPayload)
+    var toggleSource = (subcmd === "toggle" && objPayload && objPayload.item) ? (objPayload.item.source || "") : ""
+    if (subcmd === "toggle" && objPayload && objPayload.item) {
+      applyOptimisticToggle(objPayload.item.id, Boolean(objPayload.enable))
+    }
+    var q = actionQueue.slice()
+    q.push({ subcmd: subcmd, payloadStr: payloadStr, toggleSource: toggleSource })
+    actionQueue = q
+    pumpActionQueue()
   }
 
   function confirmLaunchMode() {
@@ -303,23 +405,24 @@ ShellRoot {
   }
 
   function requestToggle(item) {
-    if (!item || item.readOnly || busyAction) return
+    if (!item || item.readOnly) return
     var nextState = !item.enabled
     if (item.isCritical && !nextState) {
       confirmDisableItem = item
       return
     }
-    lastToggledItem = item
-    lastToggledPrevState = item.enabled
-    cursorItemId = item.id
+    var snapshotItem = JSON.parse(JSON.stringify(item))
+    lastToggledItem = snapshotItem
+    lastToggledPrevState = snapshotItem.enabled
+    cursorItemId = snapshotItem.id
     var kv = Object.assign({}, keepVisibleIds)
-    kv[item.id] = true
+    kv[snapshotItem.id] = true
     keepVisibleIds = kv
-    runBackendAction("toggle", { item: item, enable: nextState })
+    runBackendAction("toggle", { item: snapshotItem, enable: nextState })
   }
 
   function undoLastToggle() {
-    if (!lastToggledItem || busyAction) {
+    if (!lastToggledItem) {
       toast("Nothing to undo")
       return
     }
@@ -2141,7 +2244,7 @@ ShellRoot {
                     visible: Boolean(rowDelegate.it && !rowDelegate.it.readOnly)
                     anchors.centerIn: parent
                     checked: Boolean(rowDelegate.it && rowDelegate.it.enabled)
-                    busy: app.busyAction
+                    busy: false
                     hoverable: !listView.isScrolling
                     onToggled: if (rowDelegate.it) app.requestToggle(rowDelegate.it)
                   }

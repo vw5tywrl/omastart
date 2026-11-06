@@ -58,13 +58,30 @@ def _spawn_detached(args: list[str]) -> bool:
     try:
         subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            close_fds=True,
         )
         return True
     except Exception:
         return False
+
+
+def _spawn_bg_cmd(args: list[str]) -> None:
+    """Run a background maintenance command without blocking the UI action."""
+    try:
+        subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:
+        pass
 
 
 def _stop_user_process_safely(pid: int, command: str) -> bool:
@@ -218,11 +235,11 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
             desc = str(payload.get("description") or "").strip()
             icon = str(extra_meta.get("icon") or "").strip()
             _write_autostart_desktop_entry(usr_path, name or desktop_id, desc, command, icon)
-            _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            _spawn_bg_cmd(["systemctl", "--user", "daemon-reload"])
             return True, f"{name}: enabled at login"
         else:
             usr_path.unlink(missing_ok=True)
-            _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            _spawn_bg_cmd(["systemctl", "--user", "daemon-reload"])
             return True, f"{name}: disabled at login"
 
     if source == SourceKind.XDG_AUTOSTART:
@@ -239,7 +256,7 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
                 desc = str(payload.get("description") or "").strip()
                 icon = str(extra_meta.get("icon") or "").strip()
                 _write_autostart_desktop_entry(usr_path, name or desktop_id, desc, command, icon)
-                _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+                _spawn_bg_cmd(["systemctl", "--user", "daemon-reload"])
                 return True, f"{name}: enabled at login"
 
             if usr_path.is_file():
@@ -258,7 +275,7 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
                     cp["Desktop Entry"].pop("X-GNOME-Autostart-enabled", None)
                     with open(usr_path, "w", encoding="utf-8") as fh:
                         cp.write(fh, space_around_delimiters=False)
-            _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            _spawn_bg_cmd(["systemctl", "--user", "daemon-reload"])
             if omastart_managed:
                 return True, f"{name}: enabled at login"
             if pid == 0 and command:
@@ -268,7 +285,7 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
         else:
             if not has_sys and omastart_managed and app_desktop_path and Path(app_desktop_path).is_file():
                 usr_path.unlink(missing_ok=True)
-                _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+                _spawn_bg_cmd(["systemctl", "--user", "daemon-reload"])
                 return True, f"{name}: disabled at login"
 
             if usr_path.is_file():
@@ -282,7 +299,7 @@ def set_item_enabled_raw(payload: dict, enable: bool) -> tuple[bool, str]:
                     cp.write(fh, space_around_delimiters=False)
             else:
                 usr_path.write_text("[Desktop Entry]\nHidden=true\n", encoding="utf-8")
-            _run_cmd(["systemctl", "--user", "daemon-reload"], timeout=4.0)
+            _spawn_bg_cmd(["systemctl", "--user", "daemon-reload"])
             if pid > 0 and _stop_user_process_safely(pid, command):
                 return True, f"{name}: disabled & stopped"
             return True, f"{name}: disabled"

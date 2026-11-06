@@ -162,7 +162,34 @@ def _collect_boot_summary() -> BootSummary:
     return summary
 
 
+def _runtime_cache_dir() -> Path:
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/omastart-{os.getuid()}"
+    p = Path(base) / "omastart"
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return p
+
+
+def _current_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 def _collect_critical_chain() -> list[dict[str, object]]:
+    boot_id = _current_boot_id()
+    cache_file = _runtime_cache_dir() / "critical_chain.json"
+    if boot_id and cache_file.is_file():
+        try:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if cached.get("boot_id") == boot_id and isinstance(cached.get("tree"), list):
+                return cached["tree"]
+        except Exception:
+            pass
+
     rc, out, _ = _run_cmd(["systemd-analyze", "critical-chain", "--no-pager"], timeout=4.0)
     if rc != 0 or not out.strip():
         return []
@@ -185,6 +212,14 @@ def _collect_critical_chain() -> list[dict[str, object]]:
                 "indent": indent,
                 "raw": line.strip(),
             })
+    if boot_id and tree:
+        try:
+            cache_file.write_text(
+                json.dumps({"boot_id": boot_id, "tree": tree}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
     return tree
 
 
@@ -679,14 +714,29 @@ def _collect_hook_items() -> list[StartupItem]:
 
 
 def _parse_desktop_file(path: Path) -> dict[str, str]:
-    cp = configparser.ConfigParser(interpolation=None, strict=False)
+    out: dict[str, str] = {}
+    in_entry = False
     try:
-        cp.read(path, encoding="utf-8")
-    except Exception:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for raw in fh:
+                s = raw.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.startswith("["):
+                    if s == "[Desktop Entry]":
+                        in_entry = True
+                        continue
+                    if in_entry:
+                        break
+                    continue
+                if in_entry and "=" in s:
+                    k, v = s.split("=", 1)
+                    k = k.strip()
+                    if "[" not in k:
+                        out[k.lower()] = v.strip()
+    except OSError:
         return {}
-    if "Desktop Entry" not in cp:
-        return {}
-    return dict(cp["Desktop Entry"])
+    return out
 
 
 def _desktop_app_dirs() -> list[Path]:
@@ -901,36 +951,120 @@ def _read_unit_file_fast(unit_path: str, unit_name: str) -> tuple[str, str, str]
     return desc, exec_cmd, _resolve_binary_path(exec_cmd)
 
 
+def _fast_systemd_unit_states(user: bool) -> dict[str, str]:
+    uid = os.getuid()
+    cfg_dirs = (
+        [
+            HOME / ".config" / "systemd" / "user",
+            Path("/etc/systemd/user"),
+            Path(f"/run/user/{uid}/systemd/user"),
+        ]
+        if user
+        else [
+            Path("/etc/systemd/system"),
+            Path("/run/systemd/system"),
+        ]
+    )
+    all_dirs = cfg_dirs + (
+        [Path("/usr/lib/systemd/user")] if user else [Path("/usr/lib/systemd/system")]
+    )
+    wants: dict[str, str] = {}
+    for d in cfg_dirs:
+        if not d.is_dir():
+            continue
+        st = "enabled-runtime" if str(d).startswith("/run/") else "enabled"
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for sub in entries:
+            if sub.name.endswith((".wants", ".requires")) and sub.is_dir():
+                try:
+                    links = list(sub.iterdir())
+                except OSError:
+                    continue
+                for link in links:
+                    wants.setdefault(link.name, st)
+                    try:
+                        tname = Path(os.readlink(link)).name
+                        if "@." not in tname:
+                            wants.setdefault(tname, st)
+                    except OSError:
+                        pass
+            elif sub.is_symlink() and sub.name.endswith((".service", ".socket", ".timer")):
+                try:
+                    target = str(os.readlink(sub))
+                    if target != "/dev/null":
+                        tname = Path(target).name
+                        if "@." not in tname:
+                            wants.setdefault(tname, st)
+                except OSError:
+                    pass
+
+    states: dict[str, str] = {}
+    for d in all_dirs:
+        if not d.is_dir():
+            continue
+        is_run = str(d).startswith("/run/")
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            name = p.name
+            if not name.endswith((".service", ".socket", ".timer")) or "@." in name or name in states:
+                continue
+            if p.is_symlink():
+                try:
+                    target = str(os.readlink(p))
+                except OSError:
+                    target = ""
+                if target == "/dev/null":
+                    states[name] = "masked-runtime" if is_run else "masked"
+                continue
+            try:
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            idx = txt.find("[Install]")
+            if idx < 0:
+                continue
+            inst = txt[idx + 9 :]
+            if not re.search(
+                r"^\s*(?:WantedBy|RequiredBy|Alias|UpheldBy)\s*=", inst, re.MULTILINE
+            ):
+                continue
+            states[name] = wants.get(name, "disabled")
+    return states
+
+
 def _collect_systemd_items(user: bool) -> list[StartupItem]:
     base_cmd = ["systemctl", "--user"] if user else ["systemctl"]
     types = "service,socket,timer"
 
-    rc, out, _ = _run_cmd(
-        base_cmd
-        + [
-            "list-unit-files",
-            f"--type={types}",
-            "--state=enabled,enabled-runtime,disabled,masked,masked-runtime",
-            "--output=json",
-            "--no-pager",
-        ],
-        timeout=4.0,
-    )
-    if rc != 0 or not out.strip():
-        return []
-
-    try:
-        unit_files = json.loads(out)
-    except json.JSONDecodeError:
-        return []
-
-    unit_states: dict[str, str] = {}
-    for entry in unit_files:
-        ufile = entry.get("unit_file", "")
-        state = entry.get("state", "")
-        if not ufile or "@." in ufile:
-            continue
-        unit_states[ufile] = state
+    unit_states = _fast_systemd_unit_states(user)
+    if not unit_states:
+        rc, out, _ = _run_cmd(
+            base_cmd
+            + [
+                "list-unit-files",
+                f"--type={types}",
+                "--state=enabled,enabled-runtime,disabled,masked,masked-runtime",
+                "--output=json",
+                "--no-pager",
+            ],
+            timeout=4.0,
+        )
+        if rc != 0 or not out.strip():
+            return []
+        try:
+            for entry in json.loads(out):
+                ufile = entry.get("unit_file", "")
+                state = entry.get("state", "")
+                if ufile and "@." not in ufile:
+                    unit_states[ufile] = state
+        except json.JSONDecodeError:
+            return []
 
     if not unit_states:
         return []
@@ -1219,9 +1353,27 @@ def _enrich_packages(items: list[StartupItem]) -> None:
         return
 
     local_db = Path("/var/lib/pacman/local")
-    rel_to_pkg_dir: dict[str, Path] = {}
+    db_mtime = 0
     if local_db.is_dir():
-        remaining = set(target_rel_paths)
+        try:
+            db_mtime = local_db.stat().st_mtime_ns
+        except OSError:
+            db_mtime = 0
+
+    cache_file = _runtime_cache_dir() / "pkg_cache.json"
+    cached_map: dict[str, Optional[dict[str, str]]] = {}
+    if db_mtime and cache_file.is_file():
+        try:
+            raw_cache = json.loads(cache_file.read_text(encoding="utf-8"))
+            if raw_cache.get("mtime") == db_mtime and isinstance(raw_cache.get("paths"), dict):
+                cached_map = raw_cache["paths"]
+        except Exception:
+            cached_map = {}
+
+    missing_paths = {p for p in target_rel_paths if p not in cached_map}
+    if missing_paths and local_db.is_dir():
+        remaining = set(missing_paths)
+        rel_to_pkg_dir: dict[str, Path] = {}
         for entry in local_db.iterdir():
             if not remaining:
                 break
@@ -1237,17 +1389,51 @@ def _enrich_packages(items: list[StartupItem]) -> None:
                     rel_to_pkg_dir[ln] = entry
                     remaining.discard(ln)
 
-    pkg_cache: dict[Path, Optional[PackageInfo]] = {}
+        desc_cache: dict[Path, Optional[PackageInfo]] = {}
+        for rel in missing_paths:
+            pkg_dir = rel_to_pkg_dir.get(rel)
+            if pkg_dir is not None:
+                if pkg_dir not in desc_cache:
+                    desc_cache[pkg_dir] = _parse_pacman_desc(pkg_dir)
+                pinfo = desc_cache[pkg_dir]
+                cached_map[rel] = (
+                    {
+                        "name": pinfo.name,
+                        "version": pinfo.version,
+                        "description": pinfo.description,
+                        "installed_size": pinfo.installed_size,
+                        "url": pinfo.url,
+                        "install_reason": pinfo.install_reason,
+                    }
+                    if pinfo
+                    else None
+                )
+            else:
+                cached_map[rel] = None
+
+        if db_mtime:
+            try:
+                cache_file.write_text(
+                    json.dumps({"mtime": db_mtime, "paths": cached_map}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+
     for item, candidates in item_probes:
         for cand in candidates:
             rel = cand.lstrip("/")
-            pkg_dir = rel_to_pkg_dir.get(rel)
-            if pkg_dir is not None:
-                if pkg_dir not in pkg_cache:
-                    pkg_cache[pkg_dir] = _parse_pacman_desc(pkg_dir)
-                item.package = pkg_cache[pkg_dir]
-                if item.package:
-                    break
+            pdata = cached_map.get(rel)
+            if pdata:
+                item.package = PackageInfo(
+                    name=pdata["name"],
+                    version=pdata["version"],
+                    description=pdata["description"],
+                    installed_size=pdata["installed_size"],
+                    url=pdata["url"],
+                    install_reason=pdata["install_reason"],
+                )
+                break
 
 
 def _load_launcher_hidden_stems() -> set[str]:
@@ -1407,8 +1593,9 @@ def _collect_desktop_app_items(
 
 
 def collect_all_startup_data() -> BootSummary:
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=6) as pool:
         f_summary = pool.submit(_collect_boot_summary)
+        f_chain = pool.submit(_collect_critical_chain)
         f_procs = pool.submit(_collect_running_processes)
         f_usr_sysd = pool.submit(_collect_systemd_items, True)
         f_sys_sysd = pool.submit(_collect_systemd_items, False)
@@ -1418,15 +1605,20 @@ def collect_all_startup_data() -> BootSummary:
         f_hooks = pool.submit(_collect_hook_items)
         f_xdg = pool.submit(_collect_xdg_items, procs)
 
+        hypr_items = f_hypr.result()
+        xdg_items = f_xdg.result()
+        f_apps = pool.submit(_collect_desktop_app_items, procs, hypr_items + xdg_items)
+
         summary = f_summary.result()
         items: list[StartupItem] = []
-        items.extend(f_hypr.result())
+        items.extend(hypr_items)
         items.extend(f_hooks.result())
-        items.extend(f_xdg.result())
+        items.extend(xdg_items)
         items.extend(f_usr_sysd.result())
         items.extend(f_sys_sysd.result())
+        items.extend(f_apps.result())
+        summary.critical_chain = f_chain.result()
 
-    items.extend(_collect_desktop_app_items(procs, items))
     _enrich_packages(items)
     summary.items = items
 
@@ -1445,7 +1637,6 @@ def collect_all_startup_data() -> BootSummary:
         }
         for it in timed[:8]
     ]
-    summary.critical_chain = _collect_critical_chain()
     return summary
 
 

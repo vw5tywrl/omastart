@@ -258,7 +258,8 @@ ShellRoot {
               actionProc.currentSubcmd === "settings-set" ||
               actionProc.currentSubcmd === "open-dir" ||
               actionProc.currentSubcmd === "open-editor" ||
-              actionProc.currentSubcmd === "snapshot-save"
+              actionProc.currentSubcmd === "snapshot-save" ||
+              actionProc.currentSubcmd === "ai-inspect"
             )
             if (!fastLocalToggle && !noScanCmd) {
               app.reloadScan()
@@ -432,6 +433,31 @@ ShellRoot {
     cursorItemId = target.id
     toast("Undo: " + target.name + " -> " + (prev ? "enabled" : "disabled"))
     runBackendAction("toggle", { item: target, enable: prev })
+  }
+
+  function inspectFailedWithAi(singleItem) {
+    var targets = []
+    if (singleItem) {
+      targets.push(singleItem)
+    } else {
+      for (var i = 0; i < allItems.length; i++) {
+        var it = allItems[i]
+        if (isItemInActiveMode(it) && it.runningState === "failed") {
+          targets.push(it)
+        }
+      }
+      if (targets.length === 0) {
+        for (var j = 0; j < allItems.length; j++) {
+          if (allItems[j].runningState === "failed") targets.push(allItems[j])
+        }
+      }
+    }
+    if (targets.length === 0) {
+      toast("No failed startup processes to inspect")
+      return
+    }
+    toast("Preparing error context for Omarchy AI agent...")
+    runBackendAction("ai-inspect", { items: targets })
   }
 
   function isAppAlreadyAdded(appObj) {
@@ -1183,6 +1209,11 @@ ShellRoot {
               app.runBackendAction("run-now", { item: app.inspectedItem })
             }
             event.accepted = true
+          } else if (event.key === Qt.Key_I) {
+            if (app.inspectedItem && app.inspectedItem.runningState === "failed") {
+              app.inspectFailedWithAi(app.inspectedItem)
+            }
+            event.accepted = true
           } else if (event.key === Qt.Key_X) {
             if (app.inspectedItem && (app.inspectedItem.canDelete || app.inspectedItem.isUninstalled) && !app.inspectedItem.readOnly) {
               app.runBackendAction("delete", { item: app.inspectedItem })
@@ -1336,6 +1367,11 @@ ShellRoot {
           app.rebuildRows()
           app.toast(app.filterFailedOnly ? "Showing failed units only" : "All units")
           event.accepted = true
+        } else if (event.key === Qt.Key_I) {
+          if (app.countFailed > 0) {
+            app.inspectFailedWithAi(null)
+            event.accepted = true
+          }
         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
           var sel = app.currentCursorItem()
           if (sel) app.openInspector(sel)
@@ -1534,18 +1570,110 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             spacing: 6
 
-            OmaButton {
+            // Unified Failed Filter + Omarchy AI Inspector compound control
+            Rectangle {
+              id: failedCompoundBtn
               visible: app.countFailed > 0
-              text: "× " + app.countFailed + " FAILED"
-              dangerStyle: true
-              active: app.filterFailedOnly
-              onClicked: {
-                app.filterFailedOnly = !app.filterFailedOnly
-                app.rebuildRows()
+              readonly property real availWidth: (headerBar.width / 2 - modeSwitcher.width / 2) - 18 - addHeaderBtn.width - 16
+              width: failedInnerRow.implicitWidth
+              height: addHeaderBtn.implicitHeight
+              radius: OmaTheme.cornerRadius
+              color: OmaTheme.rgba(OmaTheme.red, 0.10)
+              border.width: 1
+              border.color: OmaTheme.rgba(
+                OmaTheme.red,
+                (failedFilterMouse.containsMouse || failedAiMouse.containsMouse || app.filterFailedOnly) ? 0.85 : 0.52
+              )
+              clip: true
+
+              Row {
+                id: failedInnerRow
+                height: parent.height
+                spacing: 0
+
+                // Left action: filter failed processes
+                Rectangle {
+                  width: failedCountLabel.implicitWidth + 14
+                  height: parent.height
+                  color: {
+                    if (failedFilterMouse.pressed) return OmaTheme.rgba(OmaTheme.red, 0.34)
+                    if (app.filterFailedOnly) return OmaTheme.rgba(OmaTheme.red, 0.24)
+                    if (failedFilterMouse.containsMouse) return OmaTheme.rgba(OmaTheme.red, 0.18)
+                    return "transparent"
+                  }
+
+                  Text {
+                    id: failedCountLabel
+                    anchors.centerIn: parent
+                    text: {
+                      if (failedCompoundBtn.availWidth >= 158) return "× " + app.countFailed + " FAILED"
+                      if (failedCompoundBtn.availWidth >= 126) return "× " + app.countFailed + " FAIL"
+                      return "× " + app.countFailed
+                    }
+                    textFormat: Text.PlainText
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontSmall
+                    font.bold: true
+                    color: OmaTheme.red
+                  }
+
+                  MouseArea {
+                    id: failedFilterMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: app.statusMessage = "Filter failed startup processes (shortcut: !)"
+                    onExited: app.statusMessage = ""
+                    onClicked: {
+                      app.filterFailedOnly = !app.filterFailedOnly
+                      app.rebuildRows()
+                    }
+                  }
+                }
+
+                // Shared internal divider
+                Rectangle {
+                  width: 1
+                  height: parent.height
+                  color: OmaTheme.rgba(OmaTheme.red, 0.45)
+                }
+
+                // Right action (inside same rectangle): Inspect with Omarchy default AI agent
+                Rectangle {
+                  width: failedAiLabel.implicitWidth + 14
+                  height: parent.height
+                  color: {
+                    if (failedAiMouse.pressed) return OmaTheme.rgba(OmaTheme.red, 0.36)
+                    if (failedAiMouse.containsMouse) return OmaTheme.rgba(OmaTheme.red, 0.24)
+                    return OmaTheme.rgba(OmaTheme.red, 0.08)
+                  }
+
+                  Text {
+                    id: failedAiLabel
+                    anchors.centerIn: parent
+                    text: "󰚩 AI"
+                    textFormat: Text.PlainText
+                    font.family: OmaTheme.fontFamily
+                    font.pixelSize: OmaTheme.fontSmall
+                    font.bold: true
+                    color: failedAiMouse.containsMouse ? OmaTheme.foreground : OmaTheme.red
+                  }
+
+                  MouseArea {
+                    id: failedAiMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onEntered: app.statusMessage = "Inspect failed processes with your default Omarchy AI agent (shortcut: i)"
+                    onExited: app.statusMessage = ""
+                    onClicked: app.inspectFailedWithAi(null)
+                  }
+                }
               }
             }
 
             OmaButton {
+              id: addHeaderBtn
               text: "+ ADD"
               accentStyle: true
               onClicked: app.openAddModal()
@@ -2527,6 +2655,13 @@ ShellRoot {
                 text: "RUN / RESTART · R"
                 accentStyle: true
                 onClicked: if (app.inspectedItem) app.runBackendAction("run-now", { item: app.inspectedItem })
+              }
+
+              OmaButton {
+                visible: app.inspectedItem !== null && app.inspectedItem.runningState === "failed"
+                text: "󰚩 AI · I"
+                dangerStyle: true
+                onClicked: if (app.inspectedItem) app.inspectFailedWithAi(app.inspectedItem)
               }
 
               OmaButton {

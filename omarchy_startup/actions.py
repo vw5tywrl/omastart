@@ -632,6 +632,214 @@ def mask_item_raw(payload: dict) -> tuple[bool, str]:
     return False, "Only systemd units can be masked."
 
 
+def _omarchy_agent_env() -> dict[str, str]:
+    env = os.environ.copy()
+    extra_dirs = [
+        str(HOME / ".local" / "bin"),
+        str(HOME / ".local" / "share" / "mise" / "command-wrappers" / "bin"),
+        str(HOME / ".local" / "share" / "mise" / "shims"),
+        "/usr/share/omarchy/bin",
+    ]
+    parts = [p for p in env.get("PATH", "").split(":") if p]
+    for d in reversed(extra_dirs):
+        if d not in parts and os.path.isdir(d):
+            parts.insert(0, d)
+    env["PATH"] = ":".join(parts)
+    return env
+
+
+def _read_default_omarchy_agent(env: dict[str, str]) -> str:
+    agent_file = HOME / ".config" / "omarchy" / "defaults" / "agent"
+    if agent_file.is_file():
+        try:
+            for ln in agent_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if ln.strip():
+                    return ln.strip()
+        except OSError:
+            pass
+    default_bin = shutil.which("omarchy-default-agent", path=env.get("PATH"))
+    if default_bin:
+        try:
+            proc = subprocess.run(
+                [default_bin],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                env=env,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip().splitlines()[0].strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _build_failed_units_ai_prompt(items: list[dict]) -> str:
+    sections: list[str] = []
+    for idx, it in enumerate(items[:6], start=1):
+        name = str(it.get("name") or it.get("unitName") or "unknown").strip()
+        unit_name = str(it.get("unitName") or "").strip()
+        src_val = str(it.get("source") or "").strip()
+        src_label = str(it.get("sourceLabel") or src_val).strip()
+        pkg_name = str(it.get("pkgName") or "").strip()
+        pkg_ver = str(it.get("pkgVersion") or "").strip()
+        cfg_path = str(it.get("configPath") or "").strip()
+        cmd_str = str(it.get("command") or "").strip()
+        trig = str(it.get("triggeredBy") or "").strip()
+
+        pkg_txt = f"{pkg_name} {pkg_ver}".strip() if pkg_name else "local / unowned"
+        header = f"[{idx}] {unit_name or name} ({src_label})"
+        meta_lines = [
+            header,
+            f"  Name:    {name}",
+            f"  Package: {pkg_txt}",
+        ]
+        if cfg_path:
+            meta_lines.append(f"  Config:  {cfg_path}")
+        if cmd_str:
+            meta_lines.append(f"  Command: {cmd_str}")
+        if trig:
+            meta_lines.append(f"  Trigger: {trig}")
+
+        status_out = ""
+        if unit_name and src_val in (SourceKind.SYSTEMD_USER.value, SourceKind.SYSTEMD_SYSTEM.value):
+            scmd = (
+                ["systemctl", "--user", "status", unit_name, "--no-pager", "-n", "12"]
+                if src_val == SourceKind.SYSTEMD_USER.value
+                else ["systemctl", "status", unit_name, "--no-pager", "-n", "12"]
+            )
+            _, st_stdout, st_stderr = _run_cmd(scmd, timeout=3.0)
+            status_out = (st_stdout or st_stderr).strip()
+            if len(status_out) > 1200:
+                status_out = status_out[-1200:]
+
+        logs_out = ""
+        try:
+            if unit_name and src_val == SourceKind.SYSTEMD_USER.value:
+                _, l_out, l_err = _run_cmd(
+                    ["journalctl", "--user", "-u", unit_name, "-b", "-n", "30", "--no-pager"],
+                    timeout=3.0,
+                )
+                logs_out = (l_out or l_err).strip()
+            elif unit_name and src_val == SourceKind.SYSTEMD_SYSTEM.value:
+                _, l_out, l_err = _run_cmd(
+                    ["journalctl", "-u", unit_name, "-b", "-n", "30", "--no-pager"],
+                    timeout=3.0,
+                )
+                logs_out = (l_out or l_err).strip()
+            else:
+                logs_out = fetch_unit_logs_raw(it, lines=30).strip()
+        except Exception:
+            logs_out = ""
+        if len(logs_out) > 1800:
+            logs_out = logs_out[-1800:]
+
+        if status_out:
+            meta_lines.append("  systemctl status:")
+            meta_lines.extend(f"    {ln}" for ln in status_out.splitlines())
+        if logs_out:
+            meta_lines.append("  Recent journal logs (current boot):")
+            meta_lines.extend(f"    {ln}" for ln in logs_out.splitlines())
+
+        sections.append("\n".join(meta_lines))
+
+    extra_note = ""
+    if len(items) > 6:
+        extra_note = f"\n(Plus {len(items) - 6} additional failed startup unit(s); check `systemctl --failed` and `systemctl --user --failed`.)\n"
+
+    body = "\n\n---\n\n".join(sections)
+    return (
+        "The following startup process(es) / systemd unit(s) failed on this Omarchy Linux machine "
+        "(detected in omastart).\n"
+        "Please analyze the error output and unit configuration for each failed process, explain the "
+        "exact root cause clearly, and suggest the cleanest fix (ask before making system-level or "
+        "destructive changes):\n\n"
+        f"{body}{extra_note}"
+    )
+
+
+def inspect_failed_with_ai_raw(items: list[dict]) -> tuple[bool, str]:
+    target_items = [it for it in (items or []) if isinstance(it, dict)]
+    if not target_items:
+        from .collector import collect_all_startup_data
+
+        summary = collect_all_startup_data()
+        target_items = [
+            it.to_ui_dict() for it in summary.items if it.running_state == "failed"
+        ]
+
+    if not target_items:
+        return False, "No failed startup processes to inspect."
+
+    prompt = _build_failed_units_ai_prompt(target_items)
+    env = _omarchy_agent_env()
+    work_dir = str(HOME / "Work") if (HOME / "Work").is_dir() else str(HOME)
+
+    omarchy_agent_bin = shutil.which("omarchy-agent", path=env.get("PATH"))
+    default_agent = _read_default_omarchy_agent(env)
+
+    if omarchy_agent_bin:
+        if not default_agent:
+            wl_copy = shutil.which("wl-copy", path=env.get("PATH"))
+            if wl_copy:
+                try:
+                    subprocess.run(
+                        [wl_copy],
+                        input=prompt,
+                        text=True,
+                        timeout=2.0,
+                        env=env,
+                    )
+                except Exception:
+                    pass
+            try:
+                subprocess.Popen(
+                    [omarchy_agent_bin, "--pick"],
+                    cwd=work_dir,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+                return True, "Select a default Omarchy agent first (error details copied)"
+            except Exception as exc:
+                return False, f"Failed to open Omarchy agent picker: {exc}"
+
+        try:
+            subprocess.Popen(
+                [omarchy_agent_bin, "--prompt", prompt],
+                cwd=work_dir,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            cnt = len(target_items)
+            noun = "failed process" if cnt == 1 else "failed processes"
+            return True, f"Opened {default_agent} to analyze {cnt} {noun}"
+        except Exception as exc:
+            return False, f"Failed to launch {default_agent}: {exc}"
+
+    # Fallback on non-Omarchy systems if a known CLI coding agent is installed
+    for cand, args in (
+        ("agy", ["agy", "--prompt-interactive", prompt]),
+        ("claude", ["claude", "--", prompt]),
+        ("codex", ["codex", "--", prompt]),
+        ("opencode", ["opencode", "--prompt", prompt]),
+    ):
+        cbin = shutil.which(cand, path=env.get("PATH"))
+        if cbin:
+            args[0] = cbin
+            if _launch_tui_command(args):
+                return True, f"Opened {cand} to analyze failed startup units"
+
+    return False, "No default Omarchy AI agent configured (`omarchy default agent`)."
+
+
 SETTINGS_FILE = HOME / ".config" / "omastart" / "settings.json"
 
 

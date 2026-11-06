@@ -1182,7 +1182,7 @@ def _collect_systemd_items(user: bool) -> list[StartupItem]:
             r_state = "inactive"
             r_label = "masked"
         elif active_state == "failed" or (
-            result and result not in ("success", "done", "")
+            result and result not in ("success", "done", "exec-condition", "skipped", "")
         ):
             r_state = "failed"
             r_label = "failed"

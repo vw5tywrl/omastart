@@ -116,6 +116,13 @@ def _handle_backend(subcmd: str, payload_raw: str) -> int:
         print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
         return 0
 
+    if subcmd == "ai-inspect":
+        from omarchy_startup.actions import inspect_failed_with_ai_raw
+
+        ok, msg = inspect_failed_with_ai_raw(data.get("items") or [])
+        print(json.dumps({"ok": ok, "message": msg}, ensure_ascii=False))
+        return 0
+
     if subcmd == "settings-get":
         from omarchy_startup.actions import get_settings_raw
 

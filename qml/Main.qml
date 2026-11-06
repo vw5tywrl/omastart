@@ -395,8 +395,26 @@ ShellRoot {
     pumpActionQueue()
   }
 
+  function switchMode(nextMode, showToast) {
+    if (app.currentMode === nextMode) return
+    app.currentMode = nextMode
+    if (nextMode === "apps") {
+      app.filterFailedOnly = false
+      app.scopeFilter = "all"
+    }
+    app.recomputeMetrics()
+    app.rebuildRows()
+    if (showToast) {
+      app.toast("Switched to " + (app.currentMode === "apps" ? "Basic Mode" : "Advanced Mode"))
+    }
+  }
+
   function confirmLaunchMode() {
     app.currentMode = app.selectedLaunchMode
+    if (app.currentMode === "apps") {
+      app.filterFailedOnly = false
+      app.scopeFilter = "all"
+    }
     app.modePromptOpen = false
     if (app.rememberModeChoice) {
       runBackendAction("settings-set", { rememberMode: true, mode: app.currentMode })
@@ -568,6 +586,9 @@ ShellRoot {
     countPackages = Object.keys(pkgSet).length
     countRunning = runningCnt
     countFailed = failedCnt
+    if (failedCnt === 0 && filterFailedOnly) {
+      filterFailedOnly = false
+    }
     scopeCounts = sc
   }
 
@@ -579,8 +600,7 @@ ShellRoot {
       var it = allItems[i]
       if (!isItemInActiveMode(it)) continue
       if (filterFailedOnly && it.runningState !== "failed") continue
-      var alwaysVisibleInBasic = (currentMode === "apps" && (it.source === "desktop-app" || q.length > 0))
-      if (!alwaysVisibleInBasic && !showDisabled && !it.enabled && !keepVisibleIds[it.id]) continue
+      if (currentMode !== "apps" && !showDisabled && !it.enabled && !keepVisibleIds[it.id]) continue
       if (scopeFilter !== "all" && it.category !== scopeFilter) continue
       if (q.length > 0) {
         var hay = (
@@ -622,22 +642,18 @@ ShellRoot {
         rows.push({ kind: "item", item: filtered[f] })
       }
     } else if (currentMode === "apps") {
-      // Basic Mode: Enabled at Login -> Disabled (when shown) -> Available Applications
+      // Basic Mode: Enabled at Login -> Available Applications (all off items unified)
       var enabledApps = []
-      var disabledApps = []
       var availableApps = []
       for (var b = 0; b < filtered.length; b++) {
         if (filtered[b].enabled) {
           enabledApps.push(filtered[b])
-        } else if (filtered[b].source === "desktop-app") {
-          availableApps.push(filtered[b])
         } else {
-          disabledApps.push(filtered[b])
+          availableApps.push(filtered[b])
         }
       }
 
       enabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
-      disabledApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
       availableApps.sort(function(a, b) { return a.name.toLowerCase().localeCompare(b.name.toLowerCase()) })
 
       if (enabledApps.length > 0) {
@@ -648,17 +664,6 @@ ShellRoot {
         })
         for (var eb = 0; eb < enabledApps.length; eb++) {
           rows.push({ kind: "item", item: enabledApps[eb] })
-        }
-      }
-
-      if (disabledApps.length > 0) {
-        rows.push({
-          kind: "header",
-          title: "DISABLED  ·  " + disabledApps.length,
-          rightMeta: "Toggle switch to re-enable"
-        })
-        for (var db = 0; db < disabledApps.length; db++) {
-          rows.push({ kind: "item", item: disabledApps[db] })
         }
       }
 
@@ -1354,18 +1359,17 @@ ShellRoot {
           app.undoLastToggle()
           event.accepted = true
         } else if (event.key === Qt.Key_M) {
-          app.currentMode = (app.currentMode === "apps") ? "system" : "apps"
-          app.recomputeMetrics()
-          app.rebuildRows()
-          app.toast("Switched to " + (app.currentMode === "apps" ? "Basic Mode" : "Advanced Mode"))
+          app.switchMode((app.currentMode === "apps") ? "system" : "apps", true)
           event.accepted = true
         } else if (event.key === Qt.Key_B) {
           app.bootModalOpen = !app.bootModalOpen
           event.accepted = true
         } else if (event.key === Qt.Key_Exclam) {
-          app.filterFailedOnly = !app.filterFailedOnly
-          app.rebuildRows()
-          app.toast(app.filterFailedOnly ? "Showing failed units only" : "All units")
+          if (app.countFailed > 0 || app.filterFailedOnly) {
+            app.filterFailedOnly = !app.filterFailedOnly
+            app.rebuildRows()
+            app.toast(app.filterFailedOnly ? "Showing failed units only" : "All units")
+          }
           event.accepted = true
         } else if (event.key === Qt.Key_I) {
           if (app.countFailed > 0) {
@@ -1384,10 +1388,12 @@ ShellRoot {
             event.accepted = true
           }
         } else if (event.key === Qt.Key_D) {
-          app.showDisabled = !app.showDisabled
-          app.recomputeMetrics()
-          app.rebuildRows()
-          event.accepted = true
+          if (app.currentMode === "system") {
+            app.showDisabled = !app.showDisabled
+            app.recomputeMetrics()
+            app.rebuildRows()
+            event.accepted = true
+          }
         } else if (event.key === Qt.Key_S) {
           app.sortMode = (app.sortMode + 1) % 3
           app.rebuildRows()
@@ -1449,7 +1455,11 @@ ShellRoot {
           // Centered Prominent Mode Switcher (BASIC / ADVANCED)
           Rectangle {
             id: modeSwitcher
-            anchors.centerIn: parent
+            anchors.verticalCenter: parent.verticalCenter
+            x: Math.max(
+              titleLabel.x + titleLabel.width + 10,
+              Math.min((parent.width - width) / 2, rightHeaderRow.x - width - 8)
+            )
             width: 212
             height: 30
             radius: OmaTheme.cornerRadius
@@ -1507,13 +1517,7 @@ ShellRoot {
                 cursorShape: Qt.PointingHandCursor
                 onEntered: app.statusMessage = "Basic mode: desktop startup applications (shortcut: m)"
                 onExited: app.statusMessage = ""
-                onClicked: {
-                  if (app.currentMode !== "apps") {
-                    app.currentMode = "apps"
-                    app.recomputeMetrics()
-                    app.rebuildRows()
-                  }
-                }
+                onClicked: app.switchMode("apps", false)
               }
             }
 
@@ -1552,13 +1556,7 @@ ShellRoot {
                 cursorShape: Qt.PointingHandCursor
                 onEntered: app.statusMessage = "Advanced mode: full systemd daemons, timers & diagnostics (shortcut: m)"
                 onExited: app.statusMessage = ""
-                onClicked: {
-                  if (app.currentMode !== "system") {
-                    app.currentMode = "system"
-                    app.recomputeMetrics()
-                    app.rebuildRows()
-                  }
-                }
+                onClicked: app.switchMode("system", false)
               }
             }
           }
@@ -1570,35 +1568,38 @@ ShellRoot {
             anchors.verticalCenter: parent.verticalCenter
             spacing: 6
 
-            // Unified Failed Filter + Omarchy AI Inspector compound control
+            // Unified Failed Filter + Analyze compound control (single rectangle & shared danger palette)
             Rectangle {
               id: failedCompoundBtn
               visible: app.countFailed > 0
-              readonly property real availWidth: (headerBar.width / 2 - modeSwitcher.width / 2) - 18 - addHeaderBtn.width - 16
-              width: failedInnerRow.implicitWidth
+              readonly property real availWidth: (headerBar.width / 2 - modeSwitcher.width / 2) - 18 - addHeaderBtn.width - 14
+              readonly property int segHPad: availWidth >= 195 ? 10 : 8
+              width: failedInnerRow.implicitWidth + 2
               height: addHeaderBtn.implicitHeight
               radius: OmaTheme.cornerRadius
-              color: OmaTheme.rgba(OmaTheme.red, 0.10)
+              color: OmaTheme.rgba(OmaTheme.red, 0.12)
               border.width: 1
               border.color: OmaTheme.rgba(
                 OmaTheme.red,
-                (failedFilterMouse.containsMouse || failedAiMouse.containsMouse || app.filterFailedOnly) ? 0.85 : 0.52
+                (failedFilterMouse.containsMouse || failedAiMouse.containsMouse || app.filterFailedOnly) ? 0.80 : 0.50
               )
               clip: true
 
               Row {
                 id: failedInnerRow
-                height: parent.height
+                x: 1
+                y: 1
+                height: parent.height - 2
                 spacing: 0
 
-                // Left action: filter failed processes
+                // Left section: filter failed processes
                 Rectangle {
-                  width: failedCountLabel.implicitWidth + 14
+                  width: failedCountLabel.implicitWidth + failedCompoundBtn.segHPad * 2
                   height: parent.height
                   color: {
-                    if (failedFilterMouse.pressed) return OmaTheme.rgba(OmaTheme.red, 0.34)
-                    if (app.filterFailedOnly) return OmaTheme.rgba(OmaTheme.red, 0.24)
-                    if (failedFilterMouse.containsMouse) return OmaTheme.rgba(OmaTheme.red, 0.18)
+                    if (failedFilterMouse.pressed) return OmaTheme.rgba(OmaTheme.red, 0.28)
+                    if (app.filterFailedOnly) return OmaTheme.rgba(OmaTheme.red, 0.20)
+                    if (failedFilterMouse.containsMouse) return OmaTheme.rgba(OmaTheme.red, 0.14)
                     return "transparent"
                   }
 
@@ -1606,8 +1607,8 @@ ShellRoot {
                     id: failedCountLabel
                     anchors.centerIn: parent
                     text: {
-                      if (failedCompoundBtn.availWidth >= 158) return "× " + app.countFailed + " FAILED"
-                      if (failedCompoundBtn.availWidth >= 126) return "× " + app.countFailed + " FAIL"
+                      if (failedCompoundBtn.availWidth >= 198) return "× " + app.countFailed + " FAILED"
+                      if (failedCompoundBtn.availWidth >= 168) return "× " + app.countFailed + " FAIL"
                       return "× " + app.countFailed
                     }
                     textFormat: Text.PlainText
@@ -1631,32 +1632,38 @@ ShellRoot {
                   }
                 }
 
-                // Shared internal divider
-                Rectangle {
+                // Subtle inset separator inside the shared rectangle
+                Item {
                   width: 1
                   height: parent.height
-                  color: OmaTheme.rgba(OmaTheme.red, 0.45)
+
+                  Rectangle {
+                    width: 1
+                    height: Math.max(10, parent.height - 8)
+                    anchors.centerIn: parent
+                    color: OmaTheme.rgba(OmaTheme.red, 0.32)
+                  }
                 }
 
-                // Right action (inside same rectangle): Inspect with Omarchy default AI agent
+                // Right section (same rectangle & palette): Analyze with Omarchy default AI agent
                 Rectangle {
-                  width: failedAiLabel.implicitWidth + 14
+                  width: failedAiLabel.implicitWidth + failedCompoundBtn.segHPad * 2
                   height: parent.height
                   color: {
-                    if (failedAiMouse.pressed) return OmaTheme.rgba(OmaTheme.red, 0.36)
-                    if (failedAiMouse.containsMouse) return OmaTheme.rgba(OmaTheme.red, 0.24)
-                    return OmaTheme.rgba(OmaTheme.red, 0.08)
+                    if (failedAiMouse.pressed) return OmaTheme.rgba(OmaTheme.red, 0.28)
+                    if (failedAiMouse.containsMouse) return OmaTheme.rgba(OmaTheme.red, 0.14)
+                    return "transparent"
                   }
 
                   Text {
                     id: failedAiLabel
                     anchors.centerIn: parent
-                    text: "󰚩 AI"
+                    text: "󰚩 ANALYZE"
                     textFormat: Text.PlainText
                     font.family: OmaTheme.fontFamily
                     font.pixelSize: OmaTheme.fontSmall
                     font.bold: true
-                    color: failedAiMouse.containsMouse ? OmaTheme.foreground : OmaTheme.red
+                    color: OmaTheme.red
                   }
 
                   MouseArea {
@@ -1664,7 +1671,7 @@ ShellRoot {
                     anchors.fill: parent
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
-                    onEntered: app.statusMessage = "Inspect failed processes with your default Omarchy AI agent (shortcut: i)"
+                    onEntered: app.statusMessage = "Analyze failed processes with your default Omarchy AI agent (shortcut: i)"
                     onExited: app.statusMessage = ""
                     onClicked: app.inspectFailedWithAi(null)
                   }
@@ -1854,11 +1861,10 @@ ShellRoot {
                 }
 
                 OmaButton {
+                  visible: app.currentMode === "system"
                   height: 26
                   hPad: 9
-                  text: app.currentMode === "apps"
-                    ? ("DISABLED" + (app.countDisabled > 0 ? " (" + app.countDisabled + ")" : ""))
-                    : "DISABLED"
+                  text: "DISABLED"
                   active: app.showDisabled
                   onClicked: {
                     app.showDisabled = !app.showDisabled
@@ -2340,7 +2346,11 @@ ShellRoot {
                   horizontalAlignment: Text.AlignRight
                   elide: Text.ElideRight
                   textFormat: Text.PlainText
-                  text: rowDelegate.it ? (rowDelegate.it.runningLabel || "") : ""
+                  text: {
+                    if (!rowDelegate.it) return ""
+                    if (app.currentMode === "apps" && !rowDelegate.it.enabled) return "off"
+                    return rowDelegate.it.runningLabel || ""
+                  }
                   font.family: OmaTheme.fontFamily
                   font.pixelSize: OmaTheme.fontCaption
                   color: {
@@ -2659,7 +2669,7 @@ ShellRoot {
 
               OmaButton {
                 visible: app.inspectedItem !== null && app.inspectedItem.runningState === "failed"
-                text: "󰚩 AI · I"
+                text: "󰚩 ANALYZE · I"
                 dangerStyle: true
                 onClicked: if (app.inspectedItem) app.inspectFailedWithAi(app.inspectedItem)
               }

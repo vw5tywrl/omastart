@@ -12,7 +12,7 @@ Switch anytime using the centered `BASIC | ADVANCED` header toggle or by pressin
 
 ### Basic Mode
 
-Clean, dead-simple login manager divided into **Enabled at Login** and **Available Applications**. Every installed desktop program (such as `Telegram`, `Firefox`, `Chromium`, `Obsidian`, etc.), user XDG autostart, Hyprland user autostart, and post-boot hook appears directly in the list — toggle any switch on to launch it automatically at next login, or toggle it off to remove it from startup without hunting through config files.
+Clean, dead-simple login manager divided into **Enabled at Login** and **Available Applications**, complete with each program's native application icon for instant visual recognition. Every installed desktop program (such as `Telegram`, `Firefox`, `Chromium`, `Obsidian`, etc.), user XDG autostart, Hyprland user autostart, and post-boot hook appears directly in the list — toggle any switch on to launch it automatically at next login, or toggle it off to remove it from startup without hunting through config files.
 
 ![Basic Mode preview](assets/screenshots/preview.png)
 

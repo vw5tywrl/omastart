@@ -2207,11 +2207,61 @@ ShellRoot {
                   }
                 }
 
+                // Application icon (Basic Mode only) — resolved by the backend
+                // from the entry's Icon= through the active icon theme; falls back
+                // to a lettered tile when the program ships no icon.
+                Item {
+                  id: appIconSlot
+                  readonly property string iconPath: (rowDelegate.it && rowDelegate.it.extraMeta)
+                    ? (rowDelegate.it.extraMeta.icon_path || "") : ""
+                  readonly property bool hasImage: iconPath !== "" && appIconImg.status !== Image.Error
+                  visible: app.currentMode === "apps" && rowDelegate.it !== null
+                  anchors.left: statusDot.right
+                  anchors.leftMargin: 4
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: visible ? 18 : 0
+                  height: 18
+                  opacity: (rowDelegate.it && rowDelegate.it.enabled) ? 1.0 : 0.72
+
+                  Image {
+                    id: appIconImg
+                    anchors.fill: parent
+                    visible: appIconSlot.hasImage
+                    source: appIconSlot.iconPath !== "" ? ("file://" + appIconSlot.iconPath) : ""
+                    sourceSize.width: 48
+                    sourceSize.height: 48
+                    fillMode: Image.PreserveAspectFit
+                    asynchronous: true
+                    cache: true
+                    smooth: true
+                    mipmap: true
+                  }
+
+                  Rectangle {
+                    anchors.fill: parent
+                    visible: !appIconSlot.hasImage
+                    radius: OmaTheme.cornerRadius
+                    color: OmaTheme.rgba(OmaTheme.foreground, 0.08)
+                    border.width: 1
+                    border.color: OmaTheme.rgba(OmaTheme.foreground, 0.16)
+
+                    Text {
+                      anchors.centerIn: parent
+                      text: (rowDelegate.it && rowDelegate.it.name) ? rowDelegate.it.name.charAt(0).toUpperCase() : ""
+                      textFormat: Text.PlainText
+                      font.family: OmaTheme.fontFamily
+                      font.pixelSize: OmaTheme.fontCaption
+                      font.bold: true
+                      color: OmaTheme.muted
+                    }
+                  }
+                }
+
                 // Program / unit name
                 Text {
                   id: nameText
-                  anchors.left: statusDot.right
-                  anchors.leftMargin: 4
+                  anchors.left: appIconSlot.visible ? appIconSlot.right : statusDot.right
+                  anchors.leftMargin: appIconSlot.visible ? 8 : 4
                   anchors.verticalCenter: parent.verticalCenter
                   width: Math.min(implicitWidth, Math.max(110, itemRect.width * 0.30))
                   elide: Text.ElideRight

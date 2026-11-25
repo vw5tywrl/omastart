@@ -1592,6 +1592,270 @@ def _collect_desktop_app_items(
     return items
 
 
+# ------------------------------------------------------------------
+# Application icon resolution (freedesktop icon theme lookup)
+# ------------------------------------------------------------------
+_ICON_EXTS = (".svg", ".png", ".xpm")
+_icon_theme_chain_cache: Optional[list[Path]] = None
+_icon_theme_dirs_cache: dict[tuple[str, bool], list[str]] = {}
+_icon_lookup_cache: dict[str, str] = {}
+_exe_icon_map_cache: Optional[dict[str, str]] = None
+
+
+def _icon_base_dirs() -> list[Path]:
+    dirs = [HOME / ".local/share/icons", HOME / ".icons"]
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        if d:
+            dirs.append(Path(d) / "icons")
+    out: list[Path] = []
+    for d in dirs:
+        if d not in out and d.is_dir():
+            out.append(d)
+    return out
+
+
+def _current_icon_theme_name() -> str:
+    rc, out, _ = _run_cmd(
+        ["gsettings", "get", "org.gnome.desktop.interface", "icon-theme"], timeout=1.0
+    )
+    name = out.strip().strip("'\"") if rc == 0 else ""
+    return name or "hicolor"
+
+
+_theme_index_cache: dict[str, Optional[configparser.ConfigParser]] = {}
+
+
+def _theme_index(theme: str) -> Optional[configparser.ConfigParser]:
+    if theme in _theme_index_cache:
+        return _theme_index_cache[theme]
+    result: Optional[configparser.ConfigParser] = None
+    for base in _icon_base_dirs():
+        idx = base / theme / "index.theme"
+        if idx.is_file():
+            cp = configparser.ConfigParser(interpolation=None, strict=False)
+            try:
+                cp.read(idx, encoding="utf-8")
+                result = cp
+            except Exception:
+                result = None
+            break
+    _theme_index_cache[theme] = result
+    return result
+
+
+def _icon_theme_chain() -> list[str]:
+    """Current theme followed by its Inherits= ancestors, always ending in hicolor."""
+    global _icon_theme_chain_cache
+    if _icon_theme_chain_cache is not None:
+        return _icon_theme_chain_cache  # type: ignore[return-value]
+    chain: list[str] = []
+    queue = [_current_icon_theme_name()]
+    while queue:
+        theme = queue.pop(0)
+        if theme in chain:
+            continue
+        chain.append(theme)
+        cp = _theme_index(theme)
+        if cp is not None and cp.has_section("Icon Theme"):
+            inherits = cp.get("Icon Theme", "Inherits", fallback="")
+            queue.extend(t.strip() for t in inherits.split(",") if t.strip())
+    if "hicolor" in chain:
+        chain.remove("hicolor")
+    chain.append("hicolor")
+    for fb in ("Adwaita", "AdwaitaLegacy"):
+        if fb not in chain:
+            chain.append(fb)
+    _icon_theme_chain_cache = chain  # type: ignore[assignment]
+    return chain
+
+
+def _theme_app_dirs(theme: str, apps_only: bool = True) -> list[str]:
+    """Icon subdirectories of a theme (applications only by default), best match (scalable / ~48px) first."""
+    key = (theme, apps_only)
+    if key in _icon_theme_dirs_cache:
+        return _icon_theme_dirs_cache[key]
+    cp = _theme_index(theme)
+    ranked: list[tuple[int, str]] = []
+    if cp is not None and cp.has_section("Icon Theme"):
+        dirs = cp.get("Icon Theme", "Directories", fallback="")
+        dirs += "," + cp.get("Icon Theme", "ScaledDirectories", fallback="")
+        for d in (x.strip() for x in dirs.split(",")):
+            if not d or not cp.has_section(d):
+                continue
+            ctx = cp.get(d, "Context", fallback="").lower()
+            is_app = ctx == "applications" or "/apps" in f"/{d}" or d.startswith("apps")
+            if apps_only and not is_app:
+                continue
+            try:
+                size = int(cp.get(d, "Size", fallback="0"))
+            except ValueError:
+                size = 0
+            kind = cp.get(d, "Type", fallback="Threshold").lower()
+            if kind == "scalable" or "scalable" in d:
+                rank = 0
+            elif size >= 48:
+                rank = 1 + (size - 48) // 16
+            else:
+                rank = 40 + (48 - size)
+            ranked.append((rank, d))
+    if not ranked and apps_only:
+        ranked = [(i, d) for i, d in enumerate(
+            ["scalable/apps", "48x48/apps", "64x64/apps", "128x128/apps",
+             "256x256/apps", "32x32/apps", "24x24/apps", "16x16/apps"]
+        )]
+    ranked.sort()
+    result = [d for _, d in ranked]
+    _icon_theme_dirs_cache[key] = result
+    return result
+
+
+def resolve_icon_path(icon: str) -> str:
+    """Resolve a desktop-entry Icon= value to an absolute image file path ('' if none)."""
+    icon = (icon or "").strip()
+    if not icon:
+        return ""
+    if icon in _icon_lookup_cache:
+        return _icon_lookup_cache[icon]
+
+    found = ""
+    if icon.startswith("/"):
+        found = icon if os.path.isfile(icon) else ""
+    else:
+        name = icon
+        for ext in _ICON_EXTS:
+            if name.endswith(ext):
+                name = name[: -len(ext)]
+                break
+        bases = _icon_base_dirs()
+        # First pass: application icons only; second pass: any context
+        # (devices/, categories/ ...) for entries like Icon=printer.
+        for apps_only in (True, False):
+            for theme in _icon_theme_chain():
+                theme_roots = [b / theme for b in bases if (b / theme).is_dir()]
+                if not theme_roots:
+                    continue
+                for sub in _theme_app_dirs(theme, apps_only):
+                    for root in theme_roots:
+                        for ext in _ICON_EXTS:
+                            cand = root / sub / f"{name}{ext}"
+                            if cand.is_file():
+                                found = str(cand)
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if not found:
+            for pix in (Path("/usr/share/pixmaps"), HOME / ".local/share/pixmaps"):
+                for ext in _ICON_EXTS:
+                    cand = pix / f"{name}{ext}"
+                    if cand.is_file():
+                        found = str(cand)
+                        break
+                if found:
+                    break
+
+    _icon_lookup_cache[icon] = found
+    return found
+
+
+def _exe_icon_map() -> dict[str, str]:
+    """Executable basename -> Icon= from installed .desktop applications."""
+    global _exe_icon_map_cache
+    if _exe_icon_map_cache is not None:
+        return _exe_icon_map_cache  # type: ignore[return-value]
+    mapping: dict[str, str] = {}
+    for d in _desktop_app_dirs():
+        for p in sorted(d.glob("*.desktop")):
+            try:
+                entry = _parse_desktop_file(p)
+            except Exception:
+                continue
+            icon = entry.get("icon", "").strip()
+            exec_raw = entry.get("exec", "").strip()
+            if not icon or not exec_raw:
+                continue
+            cmd = _clean_desktop_exec(exec_raw, terminal=entry.get("terminal", "").lower() == "true")
+            exe = os.path.basename(_extract_first_executable(cmd)).lower()
+            if exe and exe not in _MULTI_APP_WRAPPERS:
+                mapping.setdefault(exe, icon)
+    _exe_icon_map_cache = mapping  # type: ignore[assignment]
+    return mapping
+
+
+def _icon_cache_signature(theme: str) -> str:
+    """Changes when the icon theme changes or applications are (un)installed."""
+    parts = [theme]
+    for d in _desktop_app_dirs():
+        try:
+            parts.append(f"{d}:{d.stat().st_mtime_ns}")
+        except OSError:
+            pass
+    return "|".join(parts)
+
+
+def _attach_icon_paths(items: list[StartupItem]) -> None:
+    """Resolve an application icon file for every user-facing (Basic Mode) entry.
+
+    Lookups are persisted in the runtime cache so repeated scans stay instant.
+    """
+    theme = _current_icon_theme_name()
+    signature = _icon_cache_signature(theme)
+    cache_file = _runtime_cache_dir() / "icons.json"
+    item_cache: dict[str, str] = {}
+    try:
+        cached = json.loads(cache_file.read_text(encoding="utf-8"))
+        if cached.get("signature") == signature and isinstance(cached.get("items"), dict):
+            item_cache = {
+                k: v for k, v in cached["items"].items()
+                if isinstance(v, str) and (not v or os.path.isfile(v))
+            }
+    except Exception:
+        pass
+    dirty = False
+
+    for it in items:
+        if it.read_only:
+            continue
+        src = it.source.value
+        if src not in ("desktop-app", "xdg-autostart", "hyprland-user", "hook-post-boot"):
+            continue
+        icon_name = str(it.extra_meta.get("icon") or "").strip()
+        cache_key = f"{icon_name}\x1f{it.command or ''}"
+        if cache_key in item_cache:
+            it.extra_meta["icon_path"] = item_cache[cache_key]
+            continue
+        path = resolve_icon_path(icon_name) if icon_name else ""
+        if not path:
+            exe = os.path.basename(_extract_first_executable(it.command or "")).lower()
+            candidates = []
+            if exe:
+                mapped = _exe_icon_map().get(exe)
+                if mapped:
+                    candidates.append(mapped)
+                candidates.append(exe)
+            for cand in candidates:
+                path = resolve_icon_path(cand)
+                if path:
+                    break
+        it.extra_meta["icon_path"] = path
+        item_cache[cache_key] = path
+        dirty = True
+
+    if dirty:
+        try:
+            cache_file.write_text(
+                json.dumps({"signature": signature, "items": item_cache}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+
 def collect_all_startup_data() -> BootSummary:
     with ThreadPoolExecutor(max_workers=6) as pool:
         f_summary = pool.submit(_collect_boot_summary)
@@ -1620,6 +1884,7 @@ def collect_all_startup_data() -> BootSummary:
         summary.critical_chain = f_chain.result()
 
     _enrich_packages(items)
+    _attach_icon_paths(items)
     summary.items = items
 
     # Compute top slowest units on this boot for the Boot Breakdown modal

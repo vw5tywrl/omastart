@@ -1002,7 +1002,7 @@ ShellRoot {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 lineHeight: 1.15
-                text: "Manage user programs, bars, and scripts that launch when you log in (Hyprland, XDG desktop autostarts, user hooks)."
+                text: "Toggle which installed applications and custom login scripts launch automatically when you log in."
                 font.family: OmaTheme.fontFamily
                 font.pixelSize: OmaTheme.fontSmall
                 color: OmaTheme.dim
@@ -1067,7 +1067,7 @@ ShellRoot {
               }
 
               Text {
-                text: "Full Daemons & Diagnostics"
+                text: "System Services & Diagnostics"
                 font.family: OmaTheme.fontFamily
                 font.pixelSize: OmaTheme.fontCaption
                 color: OmaTheme.muted
@@ -1077,7 +1077,7 @@ ShellRoot {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 lineHeight: 1.15
-                text: "Systemd background daemons, socket activations, timers, boot bottleneck analysis, and journal logs."
+                text: "Manage systemd services, sockets, timers, boot timings, and live journal logs."
                 font.family: OmaTheme.fontFamily
                 font.pixelSize: OmaTheme.fontSmall
                 color: OmaTheme.dim
